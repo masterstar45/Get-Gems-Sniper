@@ -1,8 +1,118 @@
 import { useEffect, useState } from "react";
 import { useGetBotStatus, useUpdateBotConfig, getGetBotStatusQueryKey } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { TerminalSquare, Settings2, Save, CheckCircle, Key, ExternalLink, Zap } from "lucide-react";
+import { TerminalSquare, Settings2, Save, CheckCircle, Key, ExternalLink, Zap, Activity, AlertCircle } from "lucide-react";
 import { haptic } from "@/hooks/useTelegram";
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
+
+type ScanDiag = {
+  cycle: number;
+  collections_total: number;
+  collections_scanned: number;
+  collections_with_listings: number;
+  items_getgems: number;
+  items_below_floor: number;
+  items_qualifying: number;
+  deals_found: number;
+  tonapi_errors: number;
+  tonapi_rate_limited: boolean;
+  tonapi_key_set: boolean;
+  deal_threshold: number;
+  last_collection_scanned: string;
+  sample_prices: number[];
+  sample_floor: number;
+  age_seconds: number | null;
+  rate_limit_remaining_s: number;
+};
+
+function ScanDiagPanel() {
+  const [diag, setDiag] = useState<ScanDiag | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/debug/scan`);
+      if (r.ok) setDiag(await r.json());
+    } catch {}
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 8000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (loading) return null;
+  if (!diag || diag.cycle === 0) return (
+    <div className="px-4 py-3 rounded-xl text-xs" style={{ background: "rgba(255,255,255,0.05)", color: "var(--tg-theme-hint-color)" }}>
+      ⏳ Diagnostic scan en attente du premier cycle…
+    </div>
+  );
+
+  const hasIssue = diag.collections_with_listings === 0 || diag.tonapi_rate_limited;
+
+  return (
+    <div className="rounded-xl overflow-hidden" style={{ border: `1px solid ${hasIssue ? "rgba(255,69,58,0.3)" : "rgba(255,255,255,0.08)"}` }}>
+      <div className="flex items-center justify-between px-3 py-2" style={{ background: "rgba(255,255,255,0.04)" }}>
+        <div className="flex items-center gap-2">
+          <Activity className="w-3.5 h-3.5" style={{ color: hasIssue ? "#ff453a" : "#30d158" }} />
+          <span className="text-xs font-bold">Diagnostic scan #{diag.cycle}</span>
+          {diag.age_seconds !== null && (
+            <span className="text-[10px]" style={{ color: "var(--tg-theme-hint-color)" }}>
+              il y a {diag.age_seconds}s
+            </span>
+          )}
+        </div>
+        <button onClick={() => { refresh(); haptic.light?.(); }} className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: "rgba(255,255,255,0.08)", color: "var(--tg-theme-button-color)" }}>
+          ↻
+        </button>
+      </div>
+
+      <div className="grid grid-cols-3 gap-px" style={{ background: "rgba(255,255,255,0.06)" }}>
+        {[
+          { label: "Cols scannées", value: `${diag.collections_with_listings}/${diag.collections_scanned}`, ok: diag.collections_with_listings > 0 },
+          { label: "Items GetGems", value: diag.items_getgems, ok: diag.items_getgems > 0 },
+          { label: "Sous floor", value: diag.items_below_floor, ok: true },
+          { label: "Qualifiés", value: diag.items_qualifying, ok: true, highlight: diag.items_qualifying > 0 },
+          { label: "Deals trouvés", value: diag.deals_found, ok: true, highlight: diag.deals_found > 0 },
+          { label: "Erreurs", value: diag.tonapi_errors, ok: diag.tonapi_errors === 0, warn: diag.tonapi_errors > 0 },
+        ].map((s) => (
+          <div key={s.label} className="flex flex-col items-center py-2 px-1" style={{ background: "var(--tg-theme-section-bg-color, #1c1c1e)" }}>
+            <span className="text-sm font-black" style={{ color: s.warn ? "#ff453a" : s.highlight ? "#30d158" : !s.ok ? "#ff453a" : "var(--tg-theme-text-color)" }}>
+              {String(s.value)}
+            </span>
+            <span className="text-[9px] text-center mt-0.5" style={{ color: "var(--tg-theme-hint-color)" }}>{s.label}</span>
+          </div>
+        ))}
+      </div>
+
+      {diag.tonapi_rate_limited && (
+        <div className="flex items-center gap-2 px-3 py-2 text-xs" style={{ color: "#ff9f0a" }}>
+          <AlertCircle className="w-3 h-3" />
+          Rate limit TonAPI actif encore {diag.rate_limit_remaining_s}s
+        </div>
+      )}
+
+      {diag.collections_with_listings === 0 && !diag.tonapi_rate_limited && (
+        <div className="flex items-center gap-2 px-3 py-2 text-xs" style={{ color: "#ff453a" }}>
+          <AlertCircle className="w-3 h-3" />
+          0 collection avec listings — TonAPI ne retourne pas d'items GetGems
+        </div>
+      )}
+
+      {diag.last_collection_scanned && diag.collections_with_listings > 0 && (
+        <div className="px-3 py-2 text-[10px]" style={{ color: "var(--tg-theme-hint-color)" }}>
+          Ex: <b style={{ color: "var(--tg-theme-text-color)" }}>{diag.last_collection_scanned}</b>
+          {diag.sample_prices.length > 0 && (
+            <> — floor {diag.sample_floor.toFixed(2)} TON | prix: {diag.sample_prices.slice(0, 5).map(p => p.toFixed(2)).join(", ")} TON</>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function Section({ title, icon: Icon, children }: { title: string; icon: React.ElementType; children: React.ReactNode }) {
   return (
@@ -141,6 +251,9 @@ export default function SettingsPage() {
           <p className="text-[10px] mt-0.5" style={{ color: "var(--tg-theme-hint-color)" }}>Alertes envoyées</p>
         </div>
       </div>
+
+      {/* Diagnostic scan */}
+      <ScanDiagPanel />
 
       {/* Bloc TonAPI Key */}
       {(status as any)?.tonapiKeySet === false && (
