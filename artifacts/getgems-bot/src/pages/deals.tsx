@@ -3,10 +3,10 @@ import { useGetDeals, useGetDealStats, useGetBotStatus } from "@workspace/api-cl
 import type { Deal } from "@workspace/api-client-react";
 import { formatDistanceToNow } from "date-fns";
 import { fr } from "date-fns/locale";
-import { openLink, haptic } from "@/hooks/useTelegram";
+import { tg, haptic } from "@/hooks/useTelegram";
 import {
   Flame, Target, TrendingDown, Layers, Search, X,
-  SlidersHorizontal, ChevronRight, TrendingUp, ExternalLink
+  SlidersHorizontal, ChevronRight, TrendingUp
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
@@ -59,14 +59,26 @@ function ScoreBar({ label, value, max, color }: { label: string; value: number; 
 }
 
 function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
-  const prio = priorityLabel(deal.priority);
+  const prio    = priorityLabel(deal.priority);
   const savings = deal.floorPrice - deal.currentPrice;
+  const [imgError, setImgError] = useState(false);
 
   // Décomposition approximative du score (pour visualisation)
   const s_disc  = Math.round(Math.min(40, (deal.discountPercent / 80) * 40));
   const s_vol   = Math.round(deal.score > 50 ? 15 : 5);
   const s_trend = Math.round(deal.score > 60 ? 12 : 8);
   const s_floor = Math.round(Math.min(15, (deal.floorPrice / 100) * 15));
+
+  const handleBuy = () => {
+    haptic.medium();
+    const url = deal.link;
+    // tg.openLink ouvre dans le navigateur intégré de Telegram (reste dans l'app)
+    if (tg) {
+      try { tg.openLink(url); } catch { window.open(url, "_blank"); }
+    } else {
+      window.open(url, "_blank");
+    }
+  };
 
   return (
     <motion.div
@@ -93,13 +105,26 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
         </div>
 
         <div className="px-4 pb-8 space-y-4 max-h-[82vh] overflow-y-auto">
-          {/* Header */}
-          <div className="flex items-start justify-between">
+
+          {/* Header avec image */}
+          <div className="flex items-center gap-3">
+            <div className="w-16 h-16 rounded-2xl flex-shrink-0 overflow-hidden flex items-center justify-center"
+              style={{ background: "rgba(255,255,255,0.06)" }}>
+              {deal.imageUrl && !imgError
+                ? <img src={deal.imageUrl} alt={deal.nftName}
+                    className="w-full h-full object-cover"
+                    onError={() => setImgError(true)} />
+                : <span className="text-3xl">🎁</span>}
+            </div>
             <div className="flex-1 min-w-0">
               <p className="font-black text-base truncate">{deal.nftName}</p>
               <p className="text-xs truncate" style={{ color: TG_HINT }}>{deal.collectionName}</p>
+              <p className="text-[10px] mt-0.5" style={{ color: TG_HINT }}>
+                Détecté {formatDistanceToNow(new Date(deal.detectedAt), { addSuffix: true, locale: fr })}
+              </p>
             </div>
-            <button onClick={onClose} className="ml-2 mt-0.5 p-1 rounded-full" style={{ background: "rgba(255,255,255,0.08)" }}>
+            <button onClick={onClose} className="ml-1 mt-0.5 p-1.5 rounded-full flex-shrink-0"
+              style={{ background: "rgba(255,255,255,0.08)" }}>
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -153,20 +178,15 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
             </div>
           </div>
 
-          {/* Temps */}
-          <p className="text-[10px] text-center" style={{ color: TG_HINT }}>
-            Détecté {formatDistanceToNow(new Date(deal.detectedAt), { addSuffix: true, locale: fr })}
-          </p>
-
           {/* Bouton achat */}
           <button
-            onClick={() => { haptic.medium(); openLink(deal.link); }}
-            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-bold text-sm"
+            onClick={handleBuy}
+            className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm active:scale-[0.98] transition-transform"
             style={{ background: TG_BLUE, color: "#fff" }}
           >
-            <ExternalLink className="w-4 h-4" />
-            Acheter sur GetGems
+            🛒 Acheter sur GetGems
           </button>
+
         </div>
       </motion.div>
     </motion.div>
