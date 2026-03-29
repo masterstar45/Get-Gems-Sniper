@@ -116,7 +116,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.18, ease: "easeOut" }}
-            className="px-3 py-3 pb-24"
+            className="px-3 py-3"
+            style={{ paddingBottom: 'calc(6rem + env(safe-area-inset-bottom, 0px))' }}
           >
             {children}
           </motion.div>
