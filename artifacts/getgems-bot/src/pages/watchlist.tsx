@@ -366,22 +366,25 @@ export default function WatchlistPage() {
     }
   };
 
-  // Update threshold: remove + re-add with new threshold
+  // Update threshold: POST new entry first, THEN delete old — safe order prevents data loss
   const handleUpdateThreshold = (newThreshold: number, item: WatchlistItem) => {
     haptic.medium();
-    // Remove old entry
-    removeMutation.mutate({ id: item.id! }, {
-      onSuccess: () => {
-        // Re-add with new threshold
-        addMutation.mutate({
-          data: {
-            collectionSlug: item.collectionSlug,
-            collectionName: item.collectionName,
-            alertThreshold: newThreshold,
-          },
-        });
+    // 1. Add new entry with updated threshold
+    addMutation.mutate(
+      {
+        data: {
+          collectionSlug: item.collectionSlug,
+          collectionName: item.collectionName,
+          alertThreshold: newThreshold,
+        },
       },
-    });
+      {
+        onSuccess: () => {
+          // 2. Only remove old entry once new one is confirmed created
+          removeMutation.mutate({ id: item.id! });
+        },
+      }
+    );
   };
 
   const filtered = useMemo(() => {
