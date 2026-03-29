@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { Layout } from "@/components/layout/Layout";
 import DealsPage from "@/pages/deals";
+import StatsPage from "@/pages/stats";
 import CollectionsPage from "@/pages/collections";
 import WatchlistPage from "@/pages/watchlist";
 import SettingsPage from "@/pages/settings";
@@ -31,6 +32,7 @@ function Router() {
     <Layout>
       <Switch>
         <Route path="/" component={DealsPage} />
+        <Route path="/stats" component={StatsPage} />
         <Route path="/collections" component={CollectionsPage} />
         <Route path="/watchlist" component={WatchlistPage} />
         <Route path="/settings" component={SettingsPage} />
