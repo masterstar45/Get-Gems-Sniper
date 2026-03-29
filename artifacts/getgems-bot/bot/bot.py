@@ -567,28 +567,226 @@ async def sniper_loop():
             sleep_for = max(1.0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_for)
 
-# ─── SERVEUR KEEP-ALIVE (aiohttp.web) ────────────────────────────────────────
-# Indispensable sur Replit gratuit : UptimeRobot peut pinger cette URL
-# pour empêcher le bot de s'endormir.
+# ─── SERVEUR WEB (API REST + fichiers statiques Mini App) ────────────────────
 
-async def keepalive_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+import json as _json
+import os as _os
+
+# Dossier contenant le build React (relatif au bot.py)
+STATIC_DIR = _os.path.join(_os.path.dirname(__file__), "..", "dist", "public")
+
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+
+def json_resp(data, status=200):
+    return aiohttp.web.Response(
+        text=_json.dumps(data),
+        status=status,
+        content_type="application/json",
+        headers=cors_headers(),
+    )
+
+# ── Healthcheck ──
+async def handle_health(req):
     s = await get_stats()
-    return aiohttp.web.json_response({
-        "status": "OK",
-        "scans":  s.get("scans", 0),
-        "alerts": s.get("alerts", 0),
-        "last_scan": s.get("last_scan"),
+    return json_resp({"status": "OK", "scans": s.get("scans", 0), "alerts": s.get("alerts", 0)})
+
+# ── GET /api/deals ──
+async def handle_deals(req):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT rowid, nft_address, nft_name, collection,
+                   price_ton, floor_ton, discount, alerted_at
+            FROM alerted_nfts ORDER BY alerted_at DESC LIMIT 50
+        """) as cur:
+            rows = await cur.fetchall()
+    deals = []
+    for r in rows:
+        floor = r[5] or 1
+        price = r[4] or 0
+        disc  = r[6] or 0
+        score = compute_score(disc, floor, 0)
+        deals.append({
+            "id": r[0],
+            "nftName": r[2],
+            "collectionName": r[3],
+            "currentPrice": price,
+            "floorPrice": floor,
+            "discountPercent": round(disc, 1),
+            "score": score,
+            "priority": "high" if disc >= PRIORITY_THRESHOLD else "normal",
+            "link": f"https://getgems.io/nft/{r[1]}",
+            "imageUrl": None,
+            "detectedAt": r[7],
+        })
+    return json_resp(deals)
+
+# ── GET /api/deals/stats ──
+async def handle_deal_stats(req):
+    s = await get_stats()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM alerted_nfts WHERE discount >= ?", (PRIORITY_THRESHOLD,)) as cur:
+            high = (await cur.fetchone())[0]
+        async with db.execute("SELECT AVG(discount), COUNT(*) FROM alerted_nfts") as cur:
+            row = await cur.fetchone()
+            avg_disc = round(row[0] or 0, 1)
+            total = row[1] or 0
+        async with db.execute("SELECT COUNT(*) FROM floor_cache") as cur:
+            colls = (await cur.fetchone())[0]
+    return json_resp({
+        "totalDeals": total,
+        "highPriorityDeals": high,
+        "avgDiscount": avg_disc,
+        "totalCollections": colls,
     })
 
-async def start_keepalive_server():
+# ── GET /api/collections ──
+async def handle_collections(req):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT rowid, slug, name, floor_ton, volume_24h, item_count, updated_at
+            FROM floor_cache ORDER BY floor_ton DESC
+        """) as cur:
+            rows = await cur.fetchall()
+    return json_resp([{
+        "id": r[0], "slug": r[1], "name": r[2],
+        "floorPrice": r[3] or 0, "volume24h": r[4] or 0,
+        "itemCount": r[5] or 0, "updatedAt": r[6],
+    } for r in rows])
+
+# ── GET /api/watchlist ──
+async def handle_watchlist_get(req):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT rowid, collection_slug, collection_name, alert_threshold, added_at FROM watchlist ORDER BY added_at DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+    return json_resp([{
+        "id": r[0], "collectionSlug": r[1], "collectionName": r[2],
+        "alertThreshold": r[3], "addedAt": r[4],
+    } for r in rows])
+
+# ── POST /api/watchlist ──
+async def handle_watchlist_post(req):
+    try:
+        body = await req.json()
+        slug  = body.get("collectionSlug", "").strip()
+        name  = body.get("collectionName", "").strip()
+        thresh = int(body.get("alertThreshold", 40))
+        if not slug or not name:
+            return json_resp({"error": "slug et name requis"}, 400)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO watchlist (collection_slug, collection_name, alert_threshold, added_at) VALUES (?,?,?,datetime('now'))",
+                (slug, name, thresh)
+            )
+            await db.commit()
+            async with db.execute("SELECT last_insert_rowid()") as cur:
+                rid = (await cur.fetchone())[0]
+        return json_resp({"id": rid, "collectionSlug": slug, "collectionName": name, "alertThreshold": thresh})
+    except Exception as e:
+        return json_resp({"error": str(e)}, 500)
+
+# ── DELETE /api/watchlist/{id} ──
+async def handle_watchlist_delete(req):
+    try:
+        wid = int(req.match_info["id"])
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM watchlist WHERE rowid = ?", (wid,))
+            await db.commit()
+        return json_resp({"ok": True})
+    except Exception as e:
+        return json_resp({"error": str(e)}, 500)
+
+# ── GET /api/bot/status ──
+async def handle_bot_status(req):
+    s = await get_stats()
+    return json_resp({
+        "isRunning": True,
+        "telegramToken": "***" if TELEGRAM_TOKEN else "",
+        "chatId": TELEGRAM_CHAT_ID,
+        "scanInterval": SCAN_INTERVAL,
+        "dealThreshold": int(DEAL_THRESHOLD),
+        "priorityThreshold": int(PRIORITY_THRESHOLD),
+        "totalScans": s.get("scans", 0),
+        "totalAlertsSet": s.get("alerts", 0),
+        "lastActivity": s.get("last_scan"),
+    })
+
+# ── PUT /api/bot/config ──
+async def handle_bot_config(req):
+    # La config vit dans les variables d'environnement sur Railway
+    # On retourne juste un succès ici (les vraies configs sont dans Railway)
+    return json_resp({"ok": True, "message": "Modifiez les variables d'environnement Railway pour changer la config."})
+
+# ── OPTIONS (CORS preflight) ──
+async def handle_options(req):
+    return aiohttp.web.Response(status=204, headers=cors_headers())
+
+# ── Fichiers statiques React ──
+async def handle_static(req):
+    # Retire le préfixe de base si présent
+    path_str = req.path.lstrip("/")
+    file_path = _os.path.join(STATIC_DIR, path_str) if path_str else _os.path.join(STATIC_DIR, "index.html")
+
+    # Si le fichier n'existe pas → renvoie index.html (SPA routing)
+    if not _os.path.isfile(file_path):
+        file_path = _os.path.join(STATIC_DIR, "index.html")
+
+    if not _os.path.isfile(file_path):
+        return aiohttp.web.Response(text="Mini App non construite. Lancez le build.", status=404)
+
+    ext = _os.path.splitext(file_path)[1]
+    mime = {
+        ".html": "text/html", ".js": "application/javascript",
+        ".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml",
+        ".ico": "image/x-icon", ".json": "application/json",
+    }.get(ext, "application/octet-stream")
+
+    with open(file_path, "rb") as f:
+        return aiohttp.web.Response(body=f.read(), content_type=mime)
+
+async def init_watchlist_table():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                collection_slug  TEXT UNIQUE,
+                collection_name  TEXT,
+                alert_threshold  INTEGER DEFAULT 40,
+                added_at         TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        await db.commit()
+
+async def start_web_server():
+    await init_watchlist_table()
     app = aiohttp.web.Application()
-    app.router.add_get("/",      keepalive_handler)
-    app.router.add_get("/health", keepalive_handler)
+
+    # API routes
+    app.router.add_get("/health",               handle_health)
+    app.router.add_get("/api/deals",            handle_deals)
+    app.router.add_get("/api/deals/stats",      handle_deal_stats)
+    app.router.add_get("/api/collections",      handle_collections)
+    app.router.add_get("/api/watchlist",        handle_watchlist_get)
+    app.router.add_post("/api/watchlist",       handle_watchlist_post)
+    app.router.add_delete("/api/watchlist/{id}", handle_watchlist_delete)
+    app.router.add_get("/api/bot/status",       handle_bot_status)
+    app.router.add_put("/api/bot/config",       handle_bot_config)
+    app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
+
+    # Fichiers statiques React (tout le reste)
+    app.router.add_get("/",                     handle_static)
+    app.router.add_get("/{path_info:.*}",       handle_static)
+
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", KEEPALIVE_PORT)
     await site.start()
-    log.info(f"🌐 Serveur keep-alive démarré sur le port {KEEPALIVE_PORT}")
+    log.info(f"🌐 Serveur web démarré sur le port {KEEPALIVE_PORT} (API + Mini App statique)")
 
 # ─── POINT D'ENTRÉE ──────────────────────────────────────────────────────────
 
@@ -602,8 +800,8 @@ async def main():
 
     await init_db()
 
-    # Keep-alive non-bloquant (se lance en arrière-plan)
-    await start_keepalive_server()
+    # Serveur web : API REST + fichiers statiques Mini App
+    await start_web_server()
 
     # Sniper tourne en arrière-plan dans tous les cas
     asyncio.create_task(sniper_loop())
