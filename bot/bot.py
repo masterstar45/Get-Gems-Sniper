@@ -543,165 +543,12 @@ def _webapp_keyboard() -> InlineKeyboardMarkup | None:
 async def cmd_start(message: types.Message):
     kb = _webapp_keyboard()
     await message.answer(
-        "🤖 <b>GetGems NFT Sniper actif!</b>\n\n"
-        "Je surveille les NFT sous-évalués sur GetGems en temps réel et t'envoie une alerte dès qu'une opportunité est détectée.\n\n"
-        "📋 <b>Commandes:</b>\n"
-        "• /app — Ouvrir le dashboard complet 📊\n"
-        "• /deals — Derniers deals détectés\n"
-        "• /watchlist — Collections surveillées\n"
-        "• /stats — Statistiques du bot\n"
-        "• /floor &lt;slug&gt; — Floor d'une collection",
+        "💎 <b>GetGems NFT Sniper</b>\n\n"
+        "Je surveille les NFT sous-évalués sur GetGems en temps réel.\n"
+        "Ouvre le dashboard pour voir les deals, les tendances et configurer le bot.",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
-
-
-@dp.message(Command("app"))
-async def cmd_app(message: types.Message):
-    kb = _webapp_keyboard()
-    if not kb:
-        await message.answer(
-            "⚠️ Le dashboard n'est pas encore configuré.\n"
-            "Définissez la variable d'environnement <code>MINI_APP_URL</code> avec l'URL de votre déploiement.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    await message.answer(
-        "📊 <b>GetGems Sniper — Dashboard</b>\n\n"
-        "Consultez les deals en temps réel, gérez vos collections et configurez le bot directement depuis Telegram.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
-
-@dp.message(Command("deals"))
-async def cmd_deals(message: types.Message):
-    alerts = await get_recent_alerts(5)
-    if not alerts:
-        await message.answer("Aucun deal trouvé pour l'instant. Le bot scanne en continu...")
-        return
-    for a in alerts[:3]:
-        await message.answer(
-            f"💎 <b>{a['name']}</b>\n"
-            f"📂 {a['collection']}\n"
-            f"Prix: <b>{a['price']:.4f} TON</b> | Floor: {a['floor']:.4f} TON\n"
-            f"🔥 Réduction: <b>-{a['discount']:.1f}%</b>\n"
-            f"<a href='https://getgems.io/nft/{a['address']}'>👉 Voir sur GetGems</a>",
-            parse_mode=ParseMode.HTML,
-        )
-
-@dp.message(Command("watchlist"))
-async def cmd_watchlist(message: types.Message):
-    cols = _discovered_collections or []
-    text = f"📋 <b>{len(cols)} collections GetGems surveillées</b>\n\n"
-    for col in cols[:10]:
-        col_name = (col.get("metadata") or {}).get("name", "?")
-        text += f"• {col_name}\n"
-    if len(cols) > 10:
-        text += f"<i>… et {len(cols) - 10} autres</i>\n"
-    text += f"\n<i>Seuil deal: -{DEAL_THRESHOLD}% | Priorité: -{PRIORITY_THRESHOLD}%\nSource: TonAPI</i>"
-    await message.answer(text, parse_mode=ParseMode.HTML)
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    s = await get_stats()
-    await message.answer(
-        f"📊 <b>Statistiques:</b>\n"
-        f"Scans effectués: <b>{s.get('scans', 0)}</b>\n"
-        f"Alertes envoyées: <b>{s.get('alerts', 0)}</b>\n"
-        f"Dernier scan: <b>{s.get('last_scan', 'N/A')}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-@dp.message(Command("trends"))
-async def cmd_trends(message: types.Message):
-    await message.answer("📊 <i>Récupération des tendances en cours…</i>", parse_mode=ParseMode.HTML)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT f.slug, f.name, f.floor_ton, f.item_count,
-                   (SELECT AVG(floor_ton) FROM floor_history
-                    WHERE slug = f.slug
-                      AND recorded_at BETWEEN datetime('now', '-26 hours')
-                                          AND datetime('now', '-22 hours')) AS floor_24h,
-                   (SELECT AVG(floor_ton) FROM floor_history
-                    WHERE slug = f.slug
-                      AND recorded_at BETWEEN datetime('now', '-7 days', '-2 hours')
-                                          AND datetime('now', '-7 days', '+2 hours')) AS floor_7d
-            FROM floor_cache f
-            WHERE f.floor_ton > 0
-            ORDER BY f.item_count DESC
-            LIMIT 8
-        """) as cur:
-            rows = await cur.fetchall()
-
-    if not rows:
-        await message.answer(
-            "📊 Pas encore de données de tendances.\n"
-            "Le bot doit effectuer plusieurs scans avant d'avoir un historique.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    text = "📈 <b>Tendances des collections GetGems</b>\n<i>Via TonAPI — Floor virtuel (médiane)</i>\n\n"
-
-    for slug, name, floor, items, floor_24h, floor_7d in rows:
-        col_display = (name or slug or "?")[:22]
-
-        if floor and floor_24h and floor_24h > 0:
-            c24 = (floor - floor_24h) / floor_24h * 100
-            if c24 > 0:
-                trend_24h = f"📈 +{c24:.1f}%"
-            elif c24 < 0:
-                trend_24h = f"📉 {c24:.1f}%"
-            else:
-                trend_24h = "➡️ 0.0%"
-        else:
-            trend_24h = "➡️ N/A"
-
-        if floor and floor_7d and floor_7d > 0:
-            c7 = (floor - floor_7d) / floor_7d * 100
-            trend_7d = f"{'📈 +' if c7 > 0 else '📉 '}{c7:.1f}%"
-        else:
-            trend_7d = "➡️ N/A"
-
-        text += (
-            f"<b>{col_display}</b>\n"
-            f"💎 Floor: <code>{floor:.4f} TON</code>\n"
-            f"📊 24h: {trend_24h}  |  7j: {trend_7d}\n"
-            f"🛒 Listings: {items or 0}\n\n"
-        )
-
-    await message.answer(text, parse_mode=ParseMode.HTML)
-
-
-@dp.message(Command("floor"))
-async def cmd_floor(message: types.Message):
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.answer(
-            "Usage: /floor &lt;adresse-collection&gt;\nEx: /floor 0:3202...f23",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    addr = parts[1].strip()
-    await message.answer(f"🔍 Analyse de <code>{addr[:20]}...</code> via TonAPI...", parse_mode=ParseMode.HTML)
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        listings = await get_collection_listings(session, addr)
-        if listings:
-            floor = compute_virtual_floor(listings)
-            await message.answer(
-                f"📊 <b>Floor virtuel (médiane)</b>\n"
-                f"• Floor: <b>{floor:.4f} TON</b>\n"
-                f"• Listings GetGems: {len(listings)}\n"
-                f"• Min: {min(l['price_ton'] for l in listings):.4f} TON\n"
-                f"• Max: {max(l['price_ton'] for l in listings):.4f} TON",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await message.answer(
-                f"❌ Aucun listing GetGems trouvé pour <code>{addr}</code>.",
-                parse_mode=ParseMode.HTML,
-            )
 
 async def send_alert(deal: dict):
     if not bot or not TELEGRAM_CHAT_ID:
@@ -1652,6 +1499,13 @@ async def main():
     asyncio.create_task(sniper_loop())
 
     if bot:
+        # Supprime toutes les commandes du menu "/" — tout passe par le dashboard
+        try:
+            await bot.delete_my_commands()
+            log.info("✅ Menu de commandes Telegram effacé")
+        except Exception as e:
+            log.warning(f"Impossible d'effacer les commandes: {e}")
+
         log.info("🤖 Démarrage du polling Telegram (aiogram 3.x)...")
         # start_polling DOIT être awaité directement en aiogram 3.x
         # drop_pending_updates=True évite de traiter les vieux messages
