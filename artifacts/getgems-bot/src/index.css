@@ -71,6 +71,11 @@
     height: 100%;
     width: 100%;
     overflow: hidden;
+    /* Safe area CSS vars — valeurs par défaut (overridées par useSafeArea hook) */
+    --app-safe-top:    0px;
+    --app-safe-bottom: 0px;
+    --app-safe-left:   0px;
+    --app-safe-right:  0px;
   }
 
   body {
@@ -97,14 +102,25 @@
   .tg-header {
     background-color: var(--tg-theme-secondary-bg-color);
     border-bottom: 1px solid rgba(255,255,255,0.06);
-    /* Ajoute la hauteur de la status bar au-dessus du padding normal (0.625rem) */
-    padding-top: calc(0.625rem + env(safe-area-inset-top, 0px));
+    /* Utilise les variables dynamiques injectées par useSafeArea hook */
+    padding-top: max(
+      calc(0.625rem + var(--app-safe-top, 0px)),
+      calc(0.625rem + var(--tg-safe-area-inset-top, 0px)),
+      calc(0.625rem + var(--tg-content-safe-area-inset-top, 0px)),
+      calc(0.625rem + env(safe-area-inset-top, 0px))
+    );
   }
 
   /* Barre de navigation basse */
   .tg-tabbar {
     background-color: var(--tg-theme-secondary-bg-color);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    /* Utilise les variables dynamiques injectées par useSafeArea hook */
+    padding-bottom: max(
+      var(--app-safe-bottom, 0px),
+      var(--tg-safe-area-inset-bottom, 0px),
+      var(--tg-content-safe-area-inset-bottom, 0px),
+      env(safe-area-inset-bottom, 0px)
+    );
   }
 
   /* Carte */
