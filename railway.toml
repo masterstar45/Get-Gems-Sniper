@@ -1,7 +1,8 @@
 [build]
-builder = "nixpacks"
+buildCommand = "pip install -r requirements.txt"
 
 [deploy]
-startCommand = "python bot.py"
+startCommand = "python artifacts/getgems-bot/bot/bot.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
 restartPolicyType = "always"
-restartPolicyMaxRetries = 10
