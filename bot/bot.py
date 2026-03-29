@@ -543,6 +543,67 @@ async def cmd_stats(message: types.Message):
         parse_mode=ParseMode.HTML,
     )
 
+@dp.message(Command("trends"))
+async def cmd_trends(message: types.Message):
+    await message.answer("📊 <i>Récupération des tendances en cours…</i>", parse_mode=ParseMode.HTML)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT f.slug, f.name, f.floor_ton, f.item_count,
+                   (SELECT AVG(floor_ton) FROM floor_history
+                    WHERE slug = f.slug
+                      AND recorded_at BETWEEN datetime('now', '-26 hours')
+                                          AND datetime('now', '-22 hours')) AS floor_24h,
+                   (SELECT AVG(floor_ton) FROM floor_history
+                    WHERE slug = f.slug
+                      AND recorded_at BETWEEN datetime('now', '-7 days', '-2 hours')
+                                          AND datetime('now', '-7 days', '+2 hours')) AS floor_7d
+            FROM floor_cache f
+            WHERE f.floor_ton > 0
+            ORDER BY f.item_count DESC
+            LIMIT 8
+        """) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await message.answer(
+            "📊 Pas encore de données de tendances.\n"
+            "Le bot doit effectuer plusieurs scans avant d'avoir un historique.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    text = "📈 <b>Tendances des collections GetGems</b>\n<i>Via TonAPI — Floor virtuel (médiane)</i>\n\n"
+
+    for slug, name, floor, items, floor_24h, floor_7d in rows:
+        col_display = (name or slug or "?")[:22]
+
+        if floor and floor_24h and floor_24h > 0:
+            c24 = (floor - floor_24h) / floor_24h * 100
+            if c24 > 0:
+                trend_24h = f"📈 +{c24:.1f}%"
+            elif c24 < 0:
+                trend_24h = f"📉 {c24:.1f}%"
+            else:
+                trend_24h = "➡️ 0.0%"
+        else:
+            trend_24h = "➡️ N/A"
+
+        if floor and floor_7d and floor_7d > 0:
+            c7 = (floor - floor_7d) / floor_7d * 100
+            trend_7d = f"{'📈 +' if c7 > 0 else '📉 '}{c7:.1f}%"
+        else:
+            trend_7d = "➡️ N/A"
+
+        text += (
+            f"<b>{col_display}</b>\n"
+            f"💎 Floor: <code>{floor:.4f} TON</code>\n"
+            f"📊 24h: {trend_24h}  |  7j: {trend_7d}\n"
+            f"🛒 Listings: {items or 0}\n\n"
+        )
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
 @dp.message(Command("floor"))
 async def cmd_floor(message: types.Message):
     parts = (message.text or "").split()
@@ -1045,6 +1106,118 @@ async def handle_bot_config(req):
     # On retourne juste un succès ici (les vraies configs sont dans Railway)
     return json_resp({"ok": True, "message": "Modifiez les variables d'environnement Railway pour changer la config."})
 
+# ── GET /api/trends ──
+async def handle_trends(req):
+    """
+    Retourne les tendances de prix pour toutes les collections suivies.
+    Paramètre: ?period=24h|7d|30d
+    """
+    period = req.rel_url.query.get("period", "7d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Toutes les collections en cache (issues du scanner TonAPI)
+        async with db.execute("""
+            SELECT slug, name, floor_ton, volume_24h, item_count, updated_at
+            FROM floor_cache
+            WHERE floor_ton > 0
+            ORDER BY floor_ton DESC
+        """) as cur:
+            collections = await cur.fetchall()
+
+        result = []
+        for col in collections:
+            slug, name, current_floor, volume, item_count, updated = col
+
+            # Variation 24h
+            async with db.execute("""
+                SELECT AVG(floor_ton) FROM floor_history
+                WHERE slug = ?
+                  AND recorded_at BETWEEN datetime('now', '-26 hours')
+                                      AND datetime('now', '-22 hours')
+            """, (slug,)) as cur:
+                row = await cur.fetchone()
+                floor_24h = row[0] if row and row[0] else None
+
+            # Variation 7j
+            async with db.execute("""
+                SELECT AVG(floor_ton) FROM floor_history
+                WHERE slug = ?
+                  AND recorded_at BETWEEN datetime('now', '-7 days', '-2 hours')
+                                      AND datetime('now', '-7 days', '+2 hours')
+            """, (slug,)) as cur:
+                row = await cur.fetchone()
+                floor_7d = row[0] if row and row[0] else None
+
+            # Historique de prix selon la période
+            if period == "24h":
+                hist_sql = """
+                    SELECT strftime('%Y-%m-%dT%H:00:00', recorded_at), AVG(floor_ton)
+                    FROM floor_history
+                    WHERE slug = ? AND recorded_at >= datetime('now', '-24 hours')
+                    GROUP BY strftime('%Y-%m-%dT%H:00:00', recorded_at)
+                    ORDER BY recorded_at
+                """
+            elif period == "30d":
+                hist_sql = """
+                    SELECT strftime('%Y-%m-%d', recorded_at), AVG(floor_ton)
+                    FROM floor_history
+                    WHERE slug = ? AND recorded_at >= datetime('now', '-30 days')
+                    GROUP BY strftime('%Y-%m-%d', recorded_at)
+                    ORDER BY recorded_at
+                """
+            else:  # 7d par défaut
+                hist_sql = """
+                    SELECT strftime('%Y-%m-%d', recorded_at), AVG(floor_ton)
+                    FROM floor_history
+                    WHERE slug = ? AND recorded_at >= datetime('now', '-7 days')
+                    GROUP BY strftime('%Y-%m-%d', recorded_at)
+                    ORDER BY recorded_at
+                """
+
+            async with db.execute(hist_sql, (slug,)) as cur:
+                history_rows = await cur.fetchall()
+
+            # Calcul des % de variation
+            change_24h = None
+            if current_floor and floor_24h and floor_24h > 0:
+                change_24h = round((current_floor - floor_24h) / floor_24h * 100, 1)
+
+            change_7d = None
+            if current_floor and floor_7d and floor_7d > 0:
+                change_7d = round((current_floor - floor_7d) / floor_7d * 100, 1)
+
+            # Nombre de deals détectés par collection (proxy du volume)
+            async with db.execute("""
+                SELECT COUNT(*) FROM alerted_nfts WHERE collection = ?
+            """, (name,)) as cur:
+                row = await cur.fetchone()
+                deals_count = row[0] if row else 0
+
+            result.append({
+                "slug":         slug,
+                "name":         name or slug[:20],
+                "currentFloor": round(current_floor, 4) if current_floor else 0,
+                "itemCount":    item_count or 0,
+                "volume24h":    round(volume or 0, 2),
+                "dealsFound":   deals_count,
+                "change24h":    change_24h,
+                "change7d":     change_7d,
+                "updatedAt":    updated,
+                "floorHistory": [
+                    {"time": r[0], "floor": round(r[1], 4)}
+                    for r in history_rows if r[1]
+                ],
+            })
+
+    # Trie par activité (variation 24h absolue en premier, puis collections actives)
+    result.sort(key=lambda x: (
+        -abs(x.get("change24h") or 0),
+        -(x.get("itemCount") or 0),
+    ))
+
+    return json_resp({"collections": result, "period": period})
+
+
 # ── OPTIONS (CORS preflight) ──
 async def handle_options(req):
     return aiohttp.web.Response(status=204, headers=cors_headers())
@@ -1082,6 +1255,7 @@ async def start_web_server():
     app.router.add_get("/api/deals/history",         handle_deals_history)
     app.router.add_get("/api/stats/charts",          handle_stats_charts)
     app.router.add_get("/api/collections",           handle_collections)
+    app.router.add_get("/api/trends",               handle_trends)
     app.router.add_get("/api/watchlist",             handle_watchlist_get)
     app.router.add_post("/api/watchlist",            handle_watchlist_post)
     app.router.add_delete("/api/watchlist/{id}",     handle_watchlist_delete)
