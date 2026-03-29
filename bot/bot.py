@@ -183,6 +183,18 @@ async def save_floor_history(slug: str, floor_ton: float):
         """, (slug,))
         await db.commit()
 
+async def auto_add_to_watchlist(slug: str, name: str, threshold: int = 0) -> None:
+    """Ajoute automatiquement une collection à la watchlist si elle n'y est pas déjà."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO watchlist
+               (collection_slug, collection_name, alert_threshold, added_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            (slug, name, threshold or int(DEAL_THRESHOLD)),
+        )
+        await db.commit()
+
+
 async def get_floor_trend(slug: str) -> float:
     """Retourne le % de variation du floor vs il y a 24h (positif = hausse, négatif = baisse)."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -759,6 +771,9 @@ async def sniper_loop():
 
                     # Cache pour les stats du dashboard
                     await cache_floor(col_address, col_name, floor_ton, volume_ton, len(listings))
+
+                    # Watchlist automatique : toute collection active y est ajoutée
+                    await auto_add_to_watchlist(col_address, col_name)
 
                     for item in listings:
                         price = item["price_ton"]
