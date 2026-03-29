@@ -166,8 +166,9 @@ async def init_db():
         """)
         # Migrations sans-casse (colonnes ajoutées si absentes)
         for col_def in [
-            ("alerted_nfts", "score",    "INTEGER DEFAULT 0"),
-            ("alerted_nfts", "priority", "TEXT DEFAULT 'normal'"),
+            ("alerted_nfts", "score",     "INTEGER DEFAULT 0"),
+            ("alerted_nfts", "priority",  "TEXT DEFAULT 'normal'"),
+            ("alerted_nfts", "image_url", "TEXT DEFAULT ''"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]} {col_def[2]}")
@@ -187,13 +188,14 @@ async def is_already_alerted(address: str) -> bool:
 
 async def mark_as_alerted(address: str, name: str, collection: str,
                            price: float, floor: float, discount: float,
-                           score: int = 0, priority: str = "normal"):
+                           score: int = 0, priority: str = "normal",
+                           image_url: str = ""):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT OR IGNORE INTO alerted_nfts
-            (nft_address, nft_name, collection, price_ton, floor_ton, discount, score, priority)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (address, name, collection, price, floor, discount, score, priority))
+            (nft_address, nft_name, collection, price_ton, floor_ton, discount, score, priority, image_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (address, name, collection, price, floor, discount, score, priority, image_url))
         await db.execute(
             "UPDATE stats SET total_alerts = total_alerts + 1 WHERE id = 1"
         )
@@ -893,6 +895,7 @@ async def sniper_loop():
                             address, item["name"], col_name,
                             price, floor_ton, round(discount, 1),
                             score=score, priority=priority,
+                            image_url=item.get("image_url", ""),
                         )
                         deals_found += 1
                         col_deals += 1
@@ -995,7 +998,8 @@ async def handle_deals(req):
     sql = """
         SELECT rowid, nft_address, nft_name, collection,
                price_ton, floor_ton, discount, alerted_at,
-               COALESCE(score, 0), COALESCE(priority, 'normal')
+               COALESCE(score, 0), COALESCE(priority, 'normal'),
+               COALESCE(image_url, '')
         FROM alerted_nfts
         WHERE 1=1
     """
@@ -1019,11 +1023,13 @@ async def handle_deals(req):
         coll_lc = (r[3] or "").lower()
         if search and search not in name_lc and search not in coll_lc:
             continue
-        floor = r[5] or 1
-        price = r[4] or 0
-        disc  = r[6] or 0
-        score = r[8] or compute_score(disc, floor, 0)
+        floor    = r[5] or 1
+        price    = r[4] or 0
+        disc     = r[6] or 0
+        score    = r[8] or compute_score(disc, floor, 0)
         prio_val = r[9] or compute_priority(disc)
+        img      = r[10] or ""
+        addr     = r[1] or ""
         deals.append({
             "id":             r[0],
             "nftName":        r[2],
@@ -1033,8 +1039,8 @@ async def handle_deals(req):
             "discountPercent": round(disc, 1),
             "score":          score,
             "priority":       prio_val,
-            "link":           f"https://getgems.io/nft/{r[1]}",
-            "imageUrl":       None,
+            "link":           f"https://getgems.io/nft/{addr}",
+            "imageUrl":       img if img else None,
             "detectedAt":     r[7],
         })
     return json_resp(deals)
