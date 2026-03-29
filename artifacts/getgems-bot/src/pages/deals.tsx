@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import { useGetDeals, useGetDealStats, useGetBotStatus } from "@workspace/api-client-react";
 import type { Deal } from "@workspace/api-client-react";
 import { formatDistanceToNow } from "date-fns";
@@ -6,11 +6,16 @@ import { fr } from "date-fns/locale";
 import { tg, haptic } from "@/hooks/useTelegram";
 import {
   Flame, Target, TrendingDown, Layers, Search, X,
-  SlidersHorizontal, ChevronRight, TrendingUp
+  SlidersHorizontal, ChevronRight, Crosshair
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import {
+  AreaChart, Area, XAxis, YAxis, ResponsiveContainer, Tooltip
+} from "recharts";
 
-// ── Constantes de couleur ──────────────────────────────────────────────────────
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
+
+// ── Color constants ────────────────────────────────────────────────────────────
 
 const TG_BLUE   = "var(--tg-theme-button-color)";
 const TG_GREEN  = "#30d158";
@@ -20,6 +25,8 @@ const TG_HINT   = "var(--tg-theme-hint-color)";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+type DealEx = Deal & { source?: string; buy_link?: string };
+
 function priorityLabel(p: string) {
   if (p === "extreme") return { label: "🔴 EXTRÊME",  color: TG_RED    };
   if (p === "high")    return { label: "🟠 HOT DEAL", color: TG_ORANGE };
@@ -27,16 +34,17 @@ function priorityLabel(p: string) {
 }
 
 function sourceInfo(src: string | undefined) {
-  if (src === "fragment")      return { label: "Fragment",      emoji: "💫", color: "#0088cc" };
-  if (src === "getgems_gift")  return { label: "TG Gift",       emoji: "🎁", color: "#bf5af2" };
-  if (src === "tonnel")        return { label: "Tonnel",         emoji: "🔵", color: "#30d158" };
-  return                              { label: "GetGems",        emoji: "💎", color: TG_BLUE  };
+  if (src === "fragment")     return { label: "Fragment",  emoji: "💫", color: "#0088cc", key: "fragment" };
+  if (src === "getgems_gift") return { label: "TG Gift",   emoji: "🎁", color: "#bf5af2", key: "tg_gifts" };
+  if (src === "tg_gifts")     return { label: "TG Gift",   emoji: "🎁", color: "#bf5af2", key: "tg_gifts" };
+  if (src === "tonnel")       return { label: "Tonnel",    emoji: "🔵", color: "#30d158", key: "tonnel"   };
+  return                              { label: "GetGems",  emoji: "💎", color: TG_BLUE,   key: "getgems"  };
 }
 
 function buyButtonLabel(src: string | undefined) {
-  if (src === "fragment")     return "💫 Acheter sur Fragment";
-  if (src === "getgems_gift") return "🎁 Acheter sur GetGems";
-  if (src === "tonnel")       return "🔵 Acheter sur Tonnel";
+  if (src === "fragment")                 return "💫 Acheter sur Fragment";
+  if (src === "getgems_gift" || src === "tg_gifts") return "🎁 Acheter sur GetGems";
+  if (src === "tonnel")                   return "🔵 Acheter sur Tonnel";
   return "🛒 Acheter sur GetGems";
 }
 
@@ -47,6 +55,95 @@ function ScoreBadge({ score }: { score: number }) {
       style={{ background: `${color}22`, color, border: `1px solid ${color}44` }}>
       {score}/100
     </span>
+  );
+}
+
+// ── Floor sparkline (7j) ──────────────────────────────────────────────────────
+
+interface FloorPoint { time: string; floor: number }
+
+function FloorSparkline({ collectionName }: { collectionName: string }) {
+  const [data, setData] = useState<FloorPoint[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/trends?period=7d`);
+        if (!r.ok) return;
+        const json = await r.json();
+        const col = (json.collections ?? []).find(
+          (c: { name: string; floorHistory: FloorPoint[] }) =>
+            c.name.toLowerCase() === collectionName.toLowerCase()
+        );
+        if (!cancelled && col?.floorHistory?.length) {
+          setData(col.floorHistory);
+        }
+      } catch {}
+      if (!cancelled) setLoading(false);
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [collectionName]);
+
+  if (loading) {
+    return (
+      <div className="h-14 flex items-center justify-center">
+        <span className="text-[10px] animate-pulse" style={{ color: TG_HINT }}>Chargement historique…</span>
+      </div>
+    );
+  }
+
+  if (data.length < 2) {
+    return (
+      <div className="h-10 flex items-center justify-center">
+        <span className="text-[10px]" style={{ color: TG_HINT }}>Historique en accumulation…</span>
+      </div>
+    );
+  }
+
+  const first = data[0].floor;
+  const last  = data[data.length - 1].floor;
+  const trend = last >= first;
+  const color = trend ? TG_GREEN : TG_RED;
+
+  const shortLabel = (t: string) => {
+    if (t.includes("T")) return t.slice(11, 16);
+    return t.slice(5);
+  };
+
+  return (
+    <div>
+      <ResponsiveContainer width="100%" height={52}>
+        <AreaChart data={data} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
+          <defs>
+            <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%"  stopColor={color} stopOpacity={0.35} />
+              <stop offset="95%" stopColor={color} stopOpacity={0}    />
+            </linearGradient>
+          </defs>
+          <Area
+            type="monotone"
+            dataKey="floor"
+            stroke={color}
+            strokeWidth={1.5}
+            fill="url(#spark-grad)"
+            dot={false}
+          />
+          <XAxis dataKey="time" tickFormatter={shortLabel} tick={{ fontSize: 8, fill: TG_HINT }} axisLine={false} tickLine={false} />
+          <Tooltip
+            contentStyle={{ background: "var(--tg-theme-secondary-bg-color)", border: "none", fontSize: 10, borderRadius: 8 }}
+            formatter={(v: number) => [`${v.toFixed(4)} TON`, "Floor"]}
+            labelFormatter={shortLabel}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+      <div className="flex justify-between text-[9px] mt-0.5" style={{ color: TG_HINT }}>
+        <span>{first.toFixed(4)} TON</span>
+        <span style={{ color }}>{last >= first ? "▲" : "▼"} {last.toFixed(4)} TON</span>
+      </div>
+    </div>
   );
 }
 
@@ -72,13 +169,12 @@ function ScoreBar({ label, value, max, color }: { label: string; value: number; 
   );
 }
 
-function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
+function DealDrawer({ deal, onClose }: { deal: DealEx; onClose: () => void }) {
   const prio    = priorityLabel(deal.priority);
-  const src     = sourceInfo((deal as any).source);
+  const src     = sourceInfo(deal.source);
   const savings = deal.floorPrice - deal.currentPrice;
   const [imgError, setImgError] = useState(false);
 
-  // Décomposition approximative du score (pour visualisation)
   const s_disc  = Math.round(Math.min(40, (deal.discountPercent / 80) * 40));
   const s_vol   = Math.round(deal.score > 50 ? 15 : 5);
   const s_trend = Math.round(deal.score > 60 ? 12 : 8);
@@ -86,8 +182,7 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
 
   const handleBuy = () => {
     haptic.medium();
-    const url = deal.link;
-    // tg.openLink ouvre dans le navigateur intégré de Telegram (reste dans l'app)
+    const url = (deal as any).buy_link || deal.link;
     if (tg) {
       try { tg.openLink(url); } catch { window.open(url, "_blank"); }
     } else {
@@ -102,10 +197,8 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
     >
-      {/* Overlay */}
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
 
-      {/* Sheet */}
       <motion.div
         className="relative rounded-t-2xl overflow-hidden"
         style={{ background: "var(--tg-theme-secondary-bg-color)" }}
@@ -114,7 +207,6 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
         exit={{ y: "100%" }}
         transition={{ type: "spring", stiffness: 400, damping: 40 }}
       >
-        {/* Poignée */}
         <div className="flex justify-center pt-3 pb-1">
           <div className="w-10 h-1 rounded-full" style={{ background: "rgba(255,255,255,0.2)" }} />
         </div>
@@ -145,7 +237,7 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
             </button>
           </div>
 
-          {/* Badge priorité + score + source */}
+          {/* Badges */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs font-bold px-2.5 py-1 rounded-full"
               style={{ background: `${prio.color}22`, color: prio.color, border: `1px solid ${prio.color}44` }}>
@@ -185,16 +277,26 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
             </div>
           </div>
 
-          {/* Décomposition du score */}
+          {/* Historique du floor (sparkline 7j) */}
+          <div className="space-y-1.5">
+            <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: TG_HINT }}>
+              Historique floor — 7 jours
+            </p>
+            <div className="rounded-xl p-3" style={{ background: "rgba(255,255,255,0.04)" }}>
+              <FloorSparkline collectionName={deal.collectionName} />
+            </div>
+          </div>
+
+          {/* Score détaillé */}
           <div className="space-y-2">
             <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: TG_HINT }}>
               Score détaillé
             </p>
             <div className="rounded-xl p-3 space-y-3" style={{ background: "rgba(255,255,255,0.04)" }}>
-              <ScoreBar label="Réduction"     value={s_disc}  max={40} color={TG_GREEN}  />
-              <ScoreBar label="Liquidité"     value={s_vol}   max={25} color={TG_BLUE}   />
-              <ScoreBar label="Tendance"      value={s_trend} max={20} color={TG_ORANGE} />
-              <ScoreBar label="Valeur floor"  value={s_floor} max={15} color="#bf5af2"   />
+              <ScoreBar label="Réduction"    value={s_disc}  max={40} color={TG_GREEN}  />
+              <ScoreBar label="Liquidité"    value={s_vol}   max={25} color={TG_BLUE}   />
+              <ScoreBar label="Tendance"     value={s_trend} max={20} color={TG_ORANGE} />
+              <ScoreBar label="Valeur floor" value={s_floor} max={15} color="#bf5af2"   />
             </div>
           </div>
 
@@ -204,7 +306,7 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
             className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm active:scale-[0.98] transition-transform"
             style={{ background: src.color, color: "#fff" }}
           >
-            {buyButtonLabel((deal as any).source)}
+            {buyButtonLabel(deal.source)}
           </button>
 
         </div>
@@ -215,15 +317,41 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
 
 // ── Deal Row ──────────────────────────────────────────────────────────────────
 
-function DealRow({ deal, onTap }: { deal: Deal; onTap: () => void }) {
+function DealRow({
+  deal,
+  onTap,
+  snipeMode,
+  isNew,
+}: {
+  deal: DealEx;
+  onTap: () => void;
+  snipeMode: boolean;
+  isNew: boolean;
+}) {
   const prio = priorityLabel(deal.priority);
-  const src  = sourceInfo((deal as any).source);
+  const src  = sourceInfo(deal.source);
+  const flash = snipeMode && isNew && deal.priority === "extreme";
+
   return (
     <motion.div
-      className="tg-row items-start cursor-pointer active:scale-[0.98] transition-transform"
+      className="tg-row items-start cursor-pointer active:scale-[0.98] transition-transform relative overflow-hidden"
       onClick={() => { haptic.select(); onTap(); }}
       layout
+      initial={isNew ? { opacity: 0, x: -20 } : false}
+      animate={{ opacity: 1, x: 0 }}
+      transition={{ type: "spring", stiffness: 300, damping: 25 }}
     >
+      {/* Flash overlay pour snipe mode extreme */}
+      {flash && (
+        <motion.div
+          className="absolute inset-0 rounded-xl pointer-events-none z-10"
+          style={{ background: "rgba(255,69,58,0.35)" }}
+          initial={{ opacity: 1 }}
+          animate={{ opacity: 0 }}
+          transition={{ duration: 0.8, ease: "easeOut" }}
+        />
+      )}
+
       {/* Image */}
       <div className="w-12 h-12 rounded-xl flex-shrink-0 overflow-hidden flex items-center justify-center"
         style={{ background: "rgba(255,255,255,0.06)" }}>
@@ -272,17 +400,62 @@ function DealRow({ deal, onTap }: { deal: Deal; onTap: () => void }) {
   );
 }
 
-// ── Page principale ───────────────────────────────────────────────────────────
+// ── Source filter options ─────────────────────────────────────────────────────
+
+const SOURCES = [
+  { key: "",          label: "Toutes",    emoji: "🔍" },
+  { key: "getgems",   label: "GetGems",   emoji: "💎" },
+  { key: "tg_gifts",  label: "TG Gift",   emoji: "🎁" },
+  { key: "fragment",  label: "Fragment",  emoji: "💫" },
+  { key: "tonnel",    label: "Tonnel",    emoji: "🔵" },
+] as const;
 
 const PRIORITIES = ["", "normal", "high", "extreme"] as const;
 const PRIORITY_LABELS: Record<string, string> = {
   "": "Tous", normal: "🟢 Deal", high: "🟠 Hot", extreme: "🔴 Extrême"
 };
 
+// ── Page principale ───────────────────────────────────────────────────────────
+
 export default function DealsPage() {
   const { data: botStatus } = useGetBotStatus({ query: { refetchInterval: 8000 } });
   const { data: stats, isLoading: statsLoading, refetch: refetchStats } = useGetDealStats({ query: { refetchInterval: 10000 } });
   const { data: deals, isLoading: dealsLoading, refetch: refetchDeals, isFetching } = useGetDeals({}, { query: { refetchInterval: 8000 } });
+
+  const [search, setSearch]       = useState("");
+  const [priority, setPriority]   = useState<string>("");
+  const [source, setSource]       = useState<string>("");
+  const [minScore, setMinScore]   = useState(0);
+  const [showFilters, setShowFilters] = useState(false);
+  const [selectedDeal, setSelectedDeal] = useState<DealEx | null>(null);
+  const [snipeMode, setSnipeMode] = useState(false);
+
+  // Track which deal IDs are "new" (arrived since last render)
+  const prevIdsRef = useRef<Set<number>>(new Set());
+  const [newIds, setNewIds] = useState<Set<number>>(new Set());
+
+  useEffect(() => {
+    if (!deals) return;
+    const currentIds = new Set(deals.map((d) => d.id));
+    const arrivedIds = new Set<number>();
+    currentIds.forEach((id) => {
+      if (!prevIdsRef.current.has(id) && prevIdsRef.current.size > 0) {
+        arrivedIds.add(id);
+      }
+    });
+    if (arrivedIds.size > 0) {
+      setNewIds(arrivedIds);
+      // Snipe mode: haptic heavy for extreme new deals
+      if (snipeMode) {
+        const extremeNew = deals.filter((d) => arrivedIds.has(d.id) && d.priority === "extreme");
+        if (extremeNew.length > 0) {
+          try { haptic.heavy?.(); } catch { haptic.medium(); }
+        }
+      }
+      setTimeout(() => setNewIds(new Set()), 3000);
+    }
+    prevIdsRef.current = currentIds;
+  }, [deals, snipeMode]);
 
   const handleRefresh = () => {
     haptic.medium();
@@ -290,26 +463,24 @@ export default function DealsPage() {
     refetchStats();
   };
 
-  const [search, setSearch]     = useState("");
-  const [priority, setPriority] = useState<string>("");
-  const [minScore, setMinScore] = useState(0);
-  const [showFilters, setShowFilters] = useState(false);
-  const [selectedDeal, setSelectedDeal] = useState<Deal | null>(null);
-
   const filtered = useMemo(() => {
     if (!deals) return [];
-    return deals.filter((d) => {
+    return (deals as DealEx[]).filter((d) => {
       if (priority && d.priority !== priority) return false;
       if (minScore && d.score < minScore) return false;
+      if (source) {
+        const si = sourceInfo(d.source);
+        if (si.key !== source) return false;
+      }
       if (search) {
         const q = search.toLowerCase();
         if (!d.nftName.toLowerCase().includes(q) && !d.collectionName.toLowerCase().includes(q)) return false;
       }
       return true;
     });
-  }, [deals, priority, minScore, search]);
+  }, [deals, priority, minScore, source, search]);
 
-  const hasFilters = !!priority || minScore > 0 || !!search;
+  const hasFilters = !!priority || minScore > 0 || !!search || !!source;
 
   return (
     <div className="space-y-3">
@@ -349,7 +520,7 @@ export default function DealsPage() {
         </div>
       </div>
 
-      {/* ── Barre recherche + filtres ── */}
+      {/* ── Barre recherche + filtres + snipe ── */}
       <div className="space-y-2">
         <div className="flex gap-2">
           <div className="flex-1 flex items-center gap-2 rounded-xl px-3 py-2"
@@ -368,13 +539,27 @@ export default function DealsPage() {
               </button>
             )}
           </div>
+
+          {/* Mode Snipe toggle */}
+          <button
+            onClick={() => { haptic.select(); setSnipeMode(!snipeMode); }}
+            className="flex items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold transition-all"
+            style={{
+              background: snipeMode ? "rgba(255,69,58,0.2)" : "var(--tg-theme-secondary-bg-color)",
+              color: snipeMode ? TG_RED : TG_HINT,
+              border: snipeMode ? `1px solid ${TG_RED}66` : "1px solid transparent",
+            }}
+            title="Mode Snipe : alerte haptique sur les deals extrêmes"
+          >
+            <Crosshair className="w-3.5 h-3.5" />
+            {snipeMode && <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: TG_RED }} />}
+          </button>
+
           <button
             onClick={() => { haptic.select(); setShowFilters(!showFilters); }}
             className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition-colors"
             style={{
-              background: showFilters || hasFilters
-                ? `${TG_BLUE}22`
-                : "var(--tg-theme-secondary-bg-color)",
+              background: showFilters || hasFilters ? `${TG_BLUE}22` : "var(--tg-theme-secondary-bg-color)",
               color: showFilters || hasFilters ? TG_BLUE : TG_HINT,
               border: showFilters || hasFilters ? `1px solid ${TG_BLUE}44` : "1px solid transparent",
             }}
@@ -396,6 +581,27 @@ export default function DealsPage() {
             >
               <div className="rounded-xl p-3 space-y-3"
                 style={{ background: "var(--tg-theme-secondary-bg-color)" }}>
+
+                {/* Filtre source */}
+                <div>
+                  <p className="text-[10px] font-bold mb-2 uppercase tracking-wider" style={{ color: TG_HINT }}>Source</p>
+                  <div className="flex gap-1.5 flex-wrap">
+                    {SOURCES.map((s) => (
+                      <button key={s.key}
+                        onClick={() => { haptic.select(); setSource(s.key); }}
+                        className="text-[10px] font-bold px-2.5 py-1.5 rounded-lg transition-all"
+                        style={{
+                          background: source === s.key ? `${TG_BLUE}30` : "rgba(255,255,255,0.06)",
+                          color: source === s.key ? TG_BLUE : TG_HINT,
+                          border: source === s.key ? `1px solid ${TG_BLUE}60` : "1px solid transparent",
+                        }}
+                      >
+                        {s.emoji} {s.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 {/* Filtre priorité */}
                 <div>
                   <p className="text-[10px] font-bold mb-2 uppercase tracking-wider" style={{ color: TG_HINT }}>Priorité</p>
@@ -433,10 +639,9 @@ export default function DealsPage() {
                   </div>
                 </div>
 
-                {/* Reset */}
                 {hasFilters && (
                   <button
-                    onClick={() => { setPriority(""); setMinScore(0); setSearch(""); haptic.select(); }}
+                    onClick={() => { setPriority(""); setMinScore(0); setSearch(""); setSource(""); haptic.select(); }}
                     className="text-[10px] font-semibold"
                     style={{ color: TG_RED }}
                   >
@@ -447,6 +652,22 @@ export default function DealsPage() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* Snipe mode banner */}
+        {snipeMode && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl"
+            style={{ background: "rgba(255,69,58,0.12)", border: "1px solid rgba(255,69,58,0.3)" }}
+          >
+            <Crosshair className="w-3.5 h-3.5 flex-shrink-0" style={{ color: TG_RED }} />
+            <p className="text-[10px] font-semibold" style={{ color: TG_RED }}>
+              Mode Snipe actif — vibration + flash rouge sur les deals extrêmes
+            </p>
+          </motion.div>
+        )}
       </div>
 
       {/* ── En-tête liste + bouton refresh ── */}
@@ -493,7 +714,7 @@ export default function DealsPage() {
               <div className="flex items-center gap-1.5 text-[10px] rounded-full px-3 py-1"
                 style={{ background: "rgba(48,209,88,0.1)", color: TG_GREEN }}>
                 <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-                {(botStatus as any).totalScans ?? (botStatus as any).scan_count ?? 0} scans effectués
+                {(botStatus as any).totalScans ?? 0} scans effectués
               </div>
             )}
             {!hasFilters && (
@@ -507,8 +728,14 @@ export default function DealsPage() {
             )}
           </div>
         ) : (
-          filtered.map((deal) => (
-            <DealRow key={deal.id} deal={deal} onTap={() => setSelectedDeal(deal)} />
+          (filtered as DealEx[]).map((deal) => (
+            <DealRow
+              key={deal.id}
+              deal={deal}
+              snipeMode={snipeMode}
+              isNew={newIds.has(deal.id)}
+              onTap={() => setSelectedDeal(deal)}
+            />
           ))
         )}
       </div>
