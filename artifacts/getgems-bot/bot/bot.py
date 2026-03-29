@@ -1869,6 +1869,32 @@ async def handle_watchlist_post(req):
     except Exception as e:
         return json_resp({"error": str(e)}, 500)
 
+# ── PUT /api/watchlist/{id} ──
+async def handle_watchlist_put(req):
+    try:
+        wid = int(req.match_info["id"])
+        body = await req.json()
+        thresh = int(body.get("alertThreshold", 40))
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE watchlist SET alert_threshold = ? WHERE rowid = ?",
+                (thresh, wid)
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT rowid, collection_slug, collection_name, alert_threshold, added_at FROM watchlist WHERE rowid = ?",
+                (wid,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return json_resp({"error": "not found"}, 404)
+        return json_resp({
+            "id": row[0], "collectionSlug": row[1], "collectionName": row[2],
+            "alertThreshold": row[3], "addedAt": row[4]
+        })
+    except Exception as e:
+        return json_resp({"error": str(e)}, 500)
+
 # ── DELETE /api/watchlist/{id} ──
 async def handle_watchlist_delete(req):
     try:
@@ -2166,6 +2192,7 @@ async def start_web_server():
     app.router.add_get("/api/featured",              handle_featured)
     app.router.add_get("/api/watchlist",             handle_watchlist_get)
     app.router.add_post("/api/watchlist",            handle_watchlist_post)
+    app.router.add_put("/api/watchlist/{id}",        handle_watchlist_put)
     app.router.add_delete("/api/watchlist/{id}",     handle_watchlist_delete)
     app.router.add_get("/api/bot/status",            handle_bot_status)
     app.router.add_put("/api/bot/config",            handle_bot_config)
