@@ -204,6 +204,8 @@ async def init_db():
             ("alerted_nfts", "score",     "INTEGER DEFAULT 0"),
             ("alerted_nfts", "priority",  "TEXT DEFAULT 'normal'"),
             ("alerted_nfts", "image_url", "TEXT DEFAULT ''"),
+            ("alerted_nfts", "source",    "TEXT DEFAULT 'getgems'"),
+            ("alerted_nfts", "buy_link",  "TEXT DEFAULT ''"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]} {col_def[2]}")
@@ -224,13 +226,14 @@ async def is_already_alerted(address: str) -> bool:
 async def mark_as_alerted(address: str, name: str, collection: str,
                            price: float, floor: float, discount: float,
                            score: int = 0, priority: str = "normal",
-                           image_url: str = ""):
+                           image_url: str = "", source: str = "getgems",
+                           buy_link: str = ""):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT OR IGNORE INTO alerted_nfts
-            (nft_address, nft_name, collection, price_ton, floor_ton, discount, score, priority, image_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (address, name, collection, price, floor, discount, score, priority, image_url))
+            (nft_address, nft_name, collection, price_ton, floor_ton, discount, score, priority, image_url, source, buy_link)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (address, name, collection, price, floor, discount, score, priority, image_url, source, buy_link))
         await db.execute(
             "UPDATE stats SET total_alerts = total_alerts + 1 WHERE id = 1"
         )
@@ -455,11 +458,11 @@ async def get_collection_listings(session: aiohttp.ClientSession, col_address: s
             if not sale:
                 continue
 
-            # Filtre GetGems uniquement
-            market_name = (sale.get("market") or {}).get("name", "")
-            if "getgems" not in market_name.lower():
-                continue
+            market      = sale.get("market") or {}
+            market_name = market.get("name", "").lower()
 
+            # Accepte toutes les marketplaces : GetGems, Fragment, Tonnel, etc.
+            # (avant : filtrait uniquement getgems)
             price_nano = int((sale.get("price") or {}).get("value", 0) or 0)
             if price_nano <= 0:
                 continue
@@ -467,13 +470,27 @@ async def get_collection_listings(session: aiohttp.ClientSession, col_address: s
             price_ton = price_nano / 1e9
             previews  = item.get("previews") or []
             image_url = previews[-1]["url"] if previews else ""
+            addr      = item.get("address", "")
+            friendly  = ton_raw_to_friendly(addr)
+
+            # Génère le lien d'achat selon la marketplace
+            if "fragment" in market_name:
+                buy_link = f"https://fragment.com/nft/{friendly}"
+                source   = "fragment"
+            elif "tonnel" in market_name:
+                buy_link = f"https://tonnel.io/nft/{friendly}"
+                source   = "tonnel"
+            else:
+                buy_link = f"https://getgems.io/nft/{friendly}"
+                source   = "getgems"
 
             listings.append({
-                "address":   item.get("address", ""),
+                "address":   addr,
                 "name":      (item.get("metadata") or {}).get("name", "NFT"),
                 "price_ton": price_ton,
                 "image_url": image_url,
-                "link":      f"https://getgems.io/nft/{ton_raw_to_friendly(item.get('address', ''))}",
+                "link":      buy_link,
+                "source":    source,
             })
 
         if len(items) < limit:
@@ -496,6 +513,379 @@ def compute_virtual_floor(listings: list[dict]) -> float:
     if n % 2 == 0:
         return (prices[n // 2 - 1] + prices[n // 2]) / 2
     return prices[n // 2]
+
+# ─── GETGEMS GRAPHQL CLIENT ──────────────────────────────────────────────────
+
+GG_GRAPHQL_URL = "https://api.getgems.io/graphql"
+
+async def gg_query(session: aiohttp.ClientSession, query: str, variables: dict | None = None) -> dict | None:
+    """POST vers l'API GraphQL publique de GetGems."""
+    await asyncio.sleep(0.5)
+    try:
+        payload: dict = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        async with session.post(
+            GG_GRAPHQL_URL,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept":       "application/json",
+                "User-Agent":   get_ua(),
+                "Origin":       "https://getgems.io",
+                "Referer":      "https://getgems.io/store/gifts",
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status != 200:
+                log.debug(f"GetGems GQL HTTP {resp.status}")
+                return None
+            d = await resp.json()
+            if d.get("errors"):
+                log.debug(f"GetGems GQL errors: {d['errors'][:1]}")
+            return d.get("data")
+    except Exception as e:
+        log.debug(f"GetGems GQL: {e}")
+        return None
+
+
+# ─── SCANNER TELEGRAM GIFT NFTs (via GetGems GraphQL) ────────────────────────
+
+# Requête GraphQL : toutes les collections de type tgGift avec leur floor
+_GG_GIFTS_COLLECTIONS_QUERY = """
+{
+  alphaNftCollections(first: 100, sort: TradeVolume, types: [tgGift]) {
+    items {
+      ... on NftCollection {
+        address
+        name
+        floorPrice { value }
+        counters { activeAuctions }
+        totalSales
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+# Requête GraphQL : ventes fix_price pour une collection (triées par prix croissant)
+_GG_COLLECTION_SALES_QUERY = """
+query Sales($addr: String!, $cursor: String) {
+  alphaNftSalesByCollection(
+    collectionAddress: $addr
+    first: 100
+    sort: PriceLow
+    after: $cursor
+  ) {
+    items {
+      ... on NftSaleFixPrice {
+        nftAddress
+        fullPrice
+        nft {
+          address
+          name
+          previews { url resolution }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+_gift_collections_cache: list[dict] = []
+_gift_collections_ts: float = 0.0
+
+
+async def discover_gift_collections(session: aiohttp.ClientSession) -> list[dict]:
+    """Récupère toutes les collections Telegram Gift depuis GetGems GraphQL."""
+    global _gift_collections_cache, _gift_collections_ts
+    if time.time() - _gift_collections_ts < 1800 and _gift_collections_cache:
+        return _gift_collections_cache
+
+    data = await gg_query(session, _GG_GIFTS_COLLECTIONS_QUERY)
+    if not data:
+        return _gift_collections_cache or []
+
+    items = (data.get("alphaNftCollections") or {}).get("items") or []
+    result = []
+    for item in items:
+        addr   = item.get("address", "")
+        name   = item.get("name", "Telegram Gift")
+        active = (item.get("counters") or {}).get("activeAuctions", 0)
+        floor_val = (item.get("floorPrice") or {}).get("value")
+        floor_ton = int(floor_val) / 1e9 if floor_val else 0.0
+        if addr and active > 0:
+            result.append({
+                "address":    addr,
+                "name":       name,
+                "floor_ton":  floor_ton,
+                "total_sales": item.get("totalSales", 0),
+            })
+
+    _gift_collections_cache = result
+    _gift_collections_ts = time.time()
+    log.info(f"🎁 {len(result)} collections Telegram Gift découvertes (GetGems GQL)")
+    return result
+
+
+async def get_gift_sales_gg(session: aiohttp.ClientSession, col_address: str) -> list[dict]:
+    """Récupère les ventes fix_price d'une collection Gift via GetGems GraphQL."""
+    listings: list[dict] = []
+    cursor: str | None = None
+
+    for _ in range(5):
+        variables: dict = {"addr": col_address}
+        if cursor:
+            variables["cursor"] = cursor
+
+        data = await gg_query(session, _GG_COLLECTION_SALES_QUERY, variables)
+        if not data:
+            break
+
+        sales_data = (data.get("alphaNftSalesByCollection") or {})
+        for sale in (sales_data.get("items") or []):
+            price_nano = int(sale.get("fullPrice", 0) or 0)
+            if price_nano <= 0:
+                continue
+            nft       = sale.get("nft") or {}
+            addr      = nft.get("address") or sale.get("nftAddress", "")
+            name      = nft.get("name", "Telegram Gift")
+            previews  = nft.get("previews") or []
+            image_url = previews[-1]["url"] if previews else ""
+            friendly  = ton_raw_to_friendly(addr)
+            listings.append({
+                "address":   friendly,
+                "name":      name,
+                "price_ton": price_nano / 1e9,
+                "image_url": image_url,
+                "link":      f"https://getgems.io/nft/{friendly}",
+                "source":    "getgems_gift",
+            })
+
+        page_info = sales_data.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+
+    return listings
+
+
+async def scan_telegram_gifts(session: aiohttp.ClientSession) -> int:
+    """
+    Cycle complet : découverte des collections Gift + détection de deals.
+    Retourne le nombre de deals trouvés.
+    """
+    collections = await discover_gift_collections(session)
+    if not collections:
+        return 0
+
+    deals_found = 0
+    for col in collections:
+        col_addr  = col["address"]
+        col_name  = col["name"]
+        floor_gql = col.get("floor_ton", 0.0)
+
+        try:
+            listings = await get_gift_sales_gg(session, col_addr)
+            if len(listings) < 2:
+                continue
+
+            floor_ton = floor_gql if floor_gql > 0 else compute_virtual_floor(listings)
+            if floor_ton <= 0:
+                continue
+
+            await cache_floor(col_addr, col_name, floor_ton, 0.0, len(listings))
+            await auto_add_to_watchlist(col_addr, col_name)
+            trend = await get_floor_trend(col_addr)
+
+            log.info(f"  🎁 {col_name}: {len(listings)} ventes | floor={floor_ton:.4f} TON")
+
+            for item in listings:
+                price = item["price_ton"]
+                if price <= 0 or price >= floor_ton:
+                    continue
+                discount = (floor_ton - price) / floor_ton * 100
+                if discount < DEAL_THRESHOLD:
+                    continue
+
+                address = item["address"]
+                if await is_already_alerted(address):
+                    continue
+
+                score    = compute_score(discount, floor_ton, 0.0, trend)
+                priority = compute_priority(discount)
+
+                emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
+                log.info(
+                    f"  {emoji} [GIFT] {item['name']} @ {price:.4f} TON "
+                    f"(floor {floor_ton:.4f}) -{discount:.1f}% | score {score}"
+                )
+
+                await mark_as_alerted(
+                    address, item["name"], col_name,
+                    price, floor_ton, round(discount, 1),
+                    score=score, priority=priority,
+                    image_url=item.get("image_url", ""),
+                    source="getgems_gift",
+                    buy_link=item["link"],
+                )
+                deals_found += 1
+
+        except Exception as e:
+            log.error(f"Erreur scan Gift {col_name}: {e}")
+
+    return deals_found
+
+
+# ─── SCANNER FRAGMENT.COM (Telegram Gifts & NFTs) ────────────────────────────
+
+# Slugs de cadeaux Telegram connus sur Fragment (rotatifs entre cycles)
+_FRAGMENT_GIFT_SLUGS: list[str] = [
+    "star", "heart", "cake", "peach", "ring", "bear", "cookie",
+    "balloon", "plush-peach", "jelly-bunny", "eternal-rose",
+    "spooky-lamp", "diamond-ring", "loot-bag", "signet-ring",
+    "vintage-cigar", "christmas-tree", "crystal-ball", "trophy",
+    "candle", "flame", "bouquet", "kiss", "kiss-mark", "hamster",
+]
+_fragment_floor_cache: dict[str, float] = {}
+_fragment_slug_idx: int = 0  # rotation circulaire
+_last_fragment_scan: float = 0.0
+
+
+async def scan_fragment_gifts(session: aiohttp.ClientSession) -> int:
+    """
+    Scan partiel de Fragment.com pour les Telegram Gifts.
+    Tente d'extraire les prix via le JSON Next.js intégré dans le HTML.
+    Retourne le nombre de deals trouvés.
+    """
+    global _fragment_slug_idx, _fragment_floor_cache
+
+    import re as _re
+    import json as _json_mod
+
+    deals_found = 0
+    headers = {
+        "User-Agent":      get_ua(),
+        "Accept":          "text/html,application/xhtml+xml",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Referer":         "https://fragment.com/",
+    }
+
+    # Scanne 6 slugs par cycle en rotation (évite le ban)
+    batch = []
+    for _ in range(6):
+        batch.append(_FRAGMENT_GIFT_SLUGS[_fragment_slug_idx % len(_FRAGMENT_GIFT_SLUGS)])
+        _fragment_slug_idx += 1
+
+    for slug in batch:
+        try:
+            url = f"https://fragment.com/gift/{slug}"
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 404:
+                    continue
+                if resp.status != 200:
+                    log.debug(f"Fragment /{slug}: HTTP {resp.status}")
+                    continue
+                html = await resp.text()
+
+            # Essaie d'extraire le JSON Next.js ou des prix en TON
+            prices: list[float] = []
+
+            # Approche 1 : JSON dans script#__NEXT_DATA__
+            m = _re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.+?)</script>',
+                           html, _re.DOTALL)
+            if m:
+                try:
+                    nd = _json_mod.loads(m.group(1))
+                    # Cherche les prix dans la hiérarchie props.pageProps
+                    def _extract_prices(obj):
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in ("price", "tonPrice", "amount", "fullPrice") and isinstance(v, (int, float, str)):
+                                    try:
+                                        p = float(str(v).replace(",", "."))
+                                        # Fragment retourne les prix en nano-TON si > 1e6
+                                        if p > 1_000_000:
+                                            p /= 1e9
+                                        if 0.001 < p < 100_000:
+                                            prices.append(p)
+                                    except Exception:
+                                        pass
+                                else:
+                                    _extract_prices(v)
+                        elif isinstance(obj, list):
+                            for i in obj:
+                                _extract_prices(i)
+                    _extract_prices(nd)
+                except Exception:
+                    pass
+
+            # Approche 2 : regex sur les montants TON dans le HTML
+            if not prices:
+                for m2 in _re.finditer(r'([\d]+(?:[.,]\d+)?)\s*TON', html):
+                    try:
+                        p = float(m2.group(1).replace(",", "."))
+                        if 0.01 < p < 100_000:
+                            prices.append(p)
+                    except Exception:
+                        pass
+
+            if not prices:
+                await asyncio.sleep(1.5)
+                continue
+
+            prices.sort()
+            min_price = prices[0]
+
+            # Floor = médiane des prix observés (mise en cache entre cycles)
+            if slug not in _fragment_floor_cache or _fragment_floor_cache[slug] <= 0:
+                n = len(prices)
+                _fragment_floor_cache[slug] = prices[n // 2] if n >= 2 else min_price * 1.3
+
+            floor_ton = _fragment_floor_cache[slug]
+            # Actualise progressivement le floor (moyenne mobile)
+            _fragment_floor_cache[slug] = floor_ton * 0.85 + prices[len(prices) // 2] * 0.15
+
+            if floor_ton <= 0 or min_price >= floor_ton:
+                await asyncio.sleep(1.5)
+                continue
+
+            discount = (floor_ton - min_price) / floor_ton * 100
+            if discount < DEAL_THRESHOLD:
+                await asyncio.sleep(1.5)
+                continue
+
+            score    = compute_score(discount, floor_ton, 0.0, 0.0)
+            priority = compute_priority(discount)
+            gift_name = slug.replace("-", " ").title()
+            fake_addr = f"fragment:{slug}:{round(min_price, 4)}"
+
+            if not await is_already_alerted(fake_addr):
+                emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
+                log.info(
+                    f"  {emoji} [FRAGMENT] {gift_name} @ {min_price:.4f} TON "
+                    f"(floor {floor_ton:.4f}) -{discount:.1f}%"
+                )
+                await mark_as_alerted(
+                    fake_addr, f"🎁 {gift_name}", f"Fragment — {gift_name}",
+                    min_price, floor_ton, round(discount, 1),
+                    score=score, priority=priority,
+                    image_url="",
+                    source="fragment",
+                    buy_link=f"https://fragment.com/gift/{slug}",
+                )
+                deals_found += 1
+
+            await asyncio.sleep(2.0)  # Respecte le rate-limit Fragment
+
+        except Exception as e:
+            log.debug(f"Fragment scan {slug}: {e}")
+
+    return deals_found
+
 
 # ─── SCORING v2 (0–100) ──────────────────────────────────────────────────────
 
@@ -857,6 +1247,18 @@ async def sniper_loop():
             # ── Refresh actualités toutes les heures ─────────────────────
             await maybe_refresh_news(session)
 
+            # ── Scan Telegram Gift NFTs via GetGems GraphQL ──────────────────
+            gift_deals = await scan_telegram_gifts(session)
+            if gift_deals:
+                log.info(f"🎁 {gift_deals} deal(s) Telegram Gift trouvé(s)")
+                deals_found += gift_deals
+
+            # ── Scan Fragment.com (best effort) ──────────────────────────────
+            frag_deals = await scan_fragment_gifts(session)
+            if frag_deals:
+                log.info(f"💎 Fragment: {frag_deals} deal(s) trouvé(s)")
+                deals_found += frag_deals
+
             # ── Redécouverte des collections toutes les 30 min ──────────────
             if time.time() - _last_discovery > 1800 or not _discovered_collections:
                 collections = await discover_getgems_collections(session, pages=5)
@@ -973,6 +1375,8 @@ async def sniper_loop():
                             price, floor_ton, round(discount, 1),
                             score=score, priority=priority,
                             image_url=item.get("image_url", ""),
+                            source=item.get("source", "getgems"),
+                            buy_link=item.get("link", ""),
                         )
                         deals_found += 1
                         col_deals += 1
@@ -1076,7 +1480,7 @@ async def handle_deals(req):
         SELECT rowid, nft_address, nft_name, collection,
                price_ton, floor_ton, discount, alerted_at,
                COALESCE(score, 0), COALESCE(priority, 'normal'),
-               COALESCE(image_url, '')
+               COALESCE(image_url, ''), COALESCE(source, 'getgems'), COALESCE(buy_link, '')
         FROM alerted_nfts
         WHERE 1=1
     """
@@ -1106,7 +1510,15 @@ async def handle_deals(req):
         score    = r[8] or compute_score(disc, floor, 0)
         prio_val = r[9] or compute_priority(disc)
         img      = r[10] or ""
+        source   = r[11] or "getgems"
+        buy_link = r[12] or ""
         addr     = r[1] or ""
+        # Utilise le lien stocké si disponible, sinon génère un lien GetGems
+        if not buy_link:
+            if source == "fragment":
+                buy_link = f"https://fragment.com/nft/{ton_raw_to_friendly(addr)}"
+            else:
+                buy_link = f"https://getgems.io/nft/{ton_raw_to_friendly(addr)}"
         deals.append({
             "id":             r[0],
             "nftName":        r[2],
@@ -1116,7 +1528,8 @@ async def handle_deals(req):
             "discountPercent": round(disc, 1),
             "score":          score,
             "priority":       prio_val,
-            "link":           f"https://getgems.io/nft/{ton_raw_to_friendly(addr)}",
+            "source":         source,
+            "link":           buy_link,
             "imageUrl":       img if img else None,
             "detectedAt":     r[7],
         })
