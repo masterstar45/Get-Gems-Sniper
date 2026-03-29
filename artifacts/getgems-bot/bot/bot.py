@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-GetGems NFT Sniper Bot — Version Ultra-Rapide
-===============================================
-Stack : aiogram 3.x | aiohttp | aiosqlite | aiohttp.web (keep-alive)
-API   : GraphQL public GetGems (https://api.getgems.io/graphql)
+GetGems NFT Sniper Bot — v2.0 Amélioré
+=========================================
+Stack  : aiogram 3.x | aiohttp | aiosqlite | aiohttp.web
+API    : GraphQL public GetGems (https://api.getgems.io/graphql)
+Scoring: réduction + volume + tendance floor + stabilité
+Priority: normal (30-50%) | high (50-70%) | extreme (70%+)
 """
 
 import asyncio
@@ -11,7 +13,8 @@ import logging
 import os
 import random
 import time
-from datetime import datetime
+import psutil
+from datetime import datetime, timezone
 
 import aiohttp
 import aiohttp.web
@@ -26,14 +29,16 @@ from fake_useragent import UserAgent
 
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "7"))        # secondes
-DEAL_THRESHOLD     = float(os.getenv("DEAL_THRESHOLD", "30"))    # % réduction → bon deal
-PRIORITY_THRESHOLD = float(os.getenv("PRIORITY_THRESHOLD", "50")) # % réduction → prioritaire
+SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "7"))          # secondes entre scans
+DEAL_THRESHOLD     = float(os.getenv("DEAL_THRESHOLD", "30"))      # % réduction → deal normal
+PRIORITY_THRESHOLD = float(os.getenv("PRIORITY_THRESHOLD", "50"))  # % réduction → deal hot
+EXTREME_THRESHOLD  = float(os.getenv("EXTREME_THRESHOLD", "70"))   # % réduction → deal extrême
 DB_PATH            = os.getenv("DB_PATH", "sniper.db")
-KEEPALIVE_PORT     = int(os.getenv("PORT", "8080"))               # Replit lit $PORT
-# URL publique du dashboard (Mini App Telegram)
-# Ex: https://monapp.railway.app/getgems-bot
+KEEPALIVE_PORT     = int(os.getenv("PORT", "8080"))
 MINI_APP_URL       = os.getenv("MINI_APP_URL", "")
+
+# Timestamp de démarrage (pour uptime)
+_BOT_START_TIME = time.time()
 
 # API GraphQL GetGems (endpoint officiel, sans clé)
 GETGEMS_GQL = "https://api.getgems.io/graphql"
@@ -88,6 +93,8 @@ async def init_db():
                 price_ton   REAL,
                 floor_ton   REAL,
                 discount    REAL,
+                score       INTEGER DEFAULT 0,
+                priority    TEXT DEFAULT 'normal',
                 alerted_at  TEXT DEFAULT (datetime('now'))
             );
 
@@ -100,16 +107,41 @@ async def init_db():
                 updated_at  TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS floor_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug        TEXT NOT NULL,
+                floor_ton   REAL NOT NULL,
+                recorded_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_floor_history_slug ON floor_history(slug, recorded_at);
+
             CREATE TABLE IF NOT EXISTS stats (
-                id          INTEGER PRIMARY KEY DEFAULT 1,
-                total_scans INTEGER DEFAULT 0,
+                id           INTEGER PRIMARY KEY DEFAULT 1,
+                total_scans  INTEGER DEFAULT 0,
                 total_alerts INTEGER DEFAULT 0,
-                last_scan   TEXT
+                last_scan    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS watchlist (
+                collection_slug  TEXT UNIQUE,
+                collection_name  TEXT,
+                alert_threshold  INTEGER DEFAULT 40,
+                added_at         TEXT DEFAULT (datetime('now'))
             );
         """)
+        # Migrations sans-casse (colonnes ajoutées si absentes)
+        for col_def in [
+            ("alerted_nfts", "score",    "INTEGER DEFAULT 0"),
+            ("alerted_nfts", "priority", "TEXT DEFAULT 'normal'"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]} {col_def[2]}")
+            except Exception:
+                pass  # Colonne existe déjà
+
         await db.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
         await db.commit()
-    log.info("✅ Base de données initialisée")
+    log.info("✅ Base de données initialisée (v2)")
 
 async def is_already_alerted(address: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -119,17 +151,62 @@ async def is_already_alerted(address: str) -> bool:
             return await cursor.fetchone() is not None
 
 async def mark_as_alerted(address: str, name: str, collection: str,
-                           price: float, floor: float, discount: float):
+                           price: float, floor: float, discount: float,
+                           score: int = 0, priority: str = "normal"):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT OR IGNORE INTO alerted_nfts
-            (nft_address, nft_name, collection, price_ton, floor_ton, discount)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (address, name, collection, price, floor, discount))
+            (nft_address, nft_name, collection, price_ton, floor_ton, discount, score, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (address, name, collection, price, floor, discount, score, priority))
         await db.execute(
             "UPDATE stats SET total_alerts = total_alerts + 1 WHERE id = 1"
         )
         await db.commit()
+
+async def save_floor_history(slug: str, floor_ton: float):
+    """Enregistre le floor price actuel (max 1 entrée par heure par collection)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Vérifie si on a déjà une entrée dans la dernière heure
+        async with db.execute("""
+            SELECT 1 FROM floor_history
+            WHERE slug = ? AND recorded_at > datetime('now', '-1 hour')
+        """, (slug,)) as cur:
+            if await cur.fetchone():
+                return
+        await db.execute(
+            "INSERT INTO floor_history (slug, floor_ton) VALUES (?, ?)",
+            (slug, floor_ton)
+        )
+        # Garde seulement 30 jours d'historique
+        await db.execute("""
+            DELETE FROM floor_history
+            WHERE slug = ? AND recorded_at < datetime('now', '-30 days')
+        """, (slug,))
+        await db.commit()
+
+async def get_floor_trend(slug: str) -> float:
+    """Retourne le % de variation du floor vs il y a 24h (positif = hausse, négatif = baisse)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Floor actuel (dernière heure)
+        async with db.execute("""
+            SELECT AVG(floor_ton) FROM floor_history
+            WHERE slug = ? AND recorded_at > datetime('now', '-2 hours')
+        """, (slug,)) as cur:
+            row = await cur.fetchone()
+            current = row[0] if row and row[0] else None
+
+        # Floor d'hier (entre 22h et 26h)
+        async with db.execute("""
+            SELECT AVG(floor_ton) FROM floor_history
+            WHERE slug = ? AND recorded_at BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
+        """, (slug,)) as cur:
+            row = await cur.fetchone()
+            yesterday = row[0] if row and row[0] else None
+
+    if current and yesterday and yesterday > 0:
+        return (current - yesterday) / yesterday * 100
+    return 0.0
 
 async def get_cached_floor(slug: str) -> float | None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -147,6 +224,8 @@ async def cache_floor(slug: str, name: str, floor: float, volume: float, count: 
             VALUES (?, ?, ?, ?, ?, datetime('now'))
         """, (slug, name, floor, volume, count))
         await db.commit()
+    # Sauvegarde dans l'historique (1x/heure max)
+    await save_floor_history(slug, floor)
 
 async def increment_scan():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -301,26 +380,66 @@ async def fetch_listings(session: aiohttp.ClientSession, slug: str, limit: int =
         })
     return items
 
-# ─── SCORE 0–100 ─────────────────────────────────────────────────────────────
+# ─── SCORING v2 (0–100) ──────────────────────────────────────────────────────
 
-def compute_score(discount: float, floor: float, volume: float) -> int:
-    score = 0
-    # Réduction (50 pts max)
-    if discount >= 70:   score += 50
-    elif discount >= 50: score += 40
-    elif discount >= 30: score += 25
-    else:                score += int(discount / 2)
-    # Volume 24h (30 pts max)
-    if volume >= 1000:   score += 30
-    elif volume >= 100:  score += 20
-    elif volume >= 10:   score += 10
-    elif volume >= 1:    score += 5
-    # Floor price (20 pts max)
-    if floor >= 100:     score += 20
-    elif floor >= 10:    score += 15
-    elif floor >= 1:     score += 10
-    elif floor >= 0.1:   score += 5
-    return min(score, 100)
+def compute_score(discount: float, floor: float, volume: float,
+                  trend: float = 0.0) -> int:
+    """
+    Score 0-100 multi-critères :
+    - Réduction      : 40 pts max  (critère principal)
+    - Volume 24h     : 25 pts max  (liquidité = revente facile)
+    - Tendance floor : 20 pts max  (floor qui monte = meilleure opportunité)
+    - Floor price    : 15 pts max  (valeur absolue de l'actif)
+    """
+    # ── Réduction (40 pts) ────────────────────────────────
+    if discount >= 80:   s_disc = 40
+    elif discount >= 70: s_disc = 36
+    elif discount >= 60: s_disc = 32
+    elif discount >= 50: s_disc = 27
+    elif discount >= 40: s_disc = 20
+    elif discount >= 30: s_disc = 13
+    elif discount >= 20: s_disc = 7
+    else:                s_disc = max(0, int(discount / 4))
+
+    # ── Volume 24h (25 pts) ───────────────────────────────
+    if volume >= 5000:   s_vol = 25
+    elif volume >= 1000: s_vol = 22
+    elif volume >= 500:  s_vol = 18
+    elif volume >= 100:  s_vol = 14
+    elif volume >= 10:   s_vol = 8
+    elif volume >= 1:    s_vol = 4
+    else:                s_vol = 0
+
+    # ── Tendance floor vs hier (20 pts) ───────────────────
+    # Si le floor monte → l'actif est valorisé → deal encore meilleur
+    # Si le floor baisse → attention, actif en dépréciation
+    if trend >= 10:    s_trend = 20
+    elif trend >= 5:   s_trend = 16
+    elif trend >= 0:   s_trend = 10   # Stable ou légère hausse
+    elif trend >= -5:  s_trend = 5    # Légère baisse
+    elif trend >= -15: s_trend = 2    # Baisse modérée
+    else:              s_trend = 0    # Chute → risque élevé
+
+    # ── Floor price absolu (15 pts) ───────────────────────
+    if floor >= 500:    s_floor = 15
+    elif floor >= 100:  s_floor = 13
+    elif floor >= 50:   s_floor = 11
+    elif floor >= 10:   s_floor = 8
+    elif floor >= 1:    s_floor = 5
+    elif floor >= 0.1:  s_floor = 2
+    else:               s_floor = 0
+
+    return min(s_disc + s_vol + s_trend + s_floor, 100)
+
+
+def compute_priority(discount: float) -> str:
+    """3 niveaux de priorité basés sur la réduction."""
+    if discount >= EXTREME_THRESHOLD:
+        return "extreme"
+    if discount >= PRIORITY_THRESHOLD:
+        return "high"
+    return "normal"
+
 
 def score_bar(score: int) -> str:
     filled = round(score / 10)
@@ -438,19 +557,40 @@ async def cmd_floor(message: types.Message):
 async def send_alert(deal: dict):
     if not bot or not TELEGRAM_CHAT_ID:
         return
-    header = "🚨 <b>ALERTE PRIORITAIRE</b> 🚨" if deal["priority"] == "high" else "💰 <b>BON DEAL DÉTECTÉ</b>"
-    disc_emoji = "🔥" if deal["discount"] >= 50 else "✅"
+
+    priority = deal.get("priority", "normal")
+    score    = deal.get("score", 0)
+    trend    = deal.get("trend", 0.0)
+    discount = deal["discount"]
+
+    # ── En-tête selon priorité ──────────────────────────────────────────
+    if priority == "extreme":
+        header = "🔴 <b>DEAL EXTRÊME — OPPORTUNITÉ RARE !</b> 🔴"
+    elif priority == "high":
+        header = "🟠 <b>HOT DEAL — PRIORITAIRE !</b>"
+    else:
+        header = "🟢 <b>BON DEAL DÉTECTÉ</b>"
+
+    # ── Indicateur de tendance ──────────────────────────────────────────
+    if trend > 5:
+        trend_str = f"📈 Floor en hausse (+{trend:.1f}% / 24h)"
+    elif trend < -5:
+        trend_str = f"📉 Floor en baisse ({trend:.1f}% / 24h) ⚠️"
+    else:
+        trend_str = f"➡️ Floor stable ({trend:+.1f}% / 24h)"
+
     msg = (
         f"{header}\n\n"
         f"🎁 <b>{deal['name']}</b>\n"
         f"📂 Collection: <i>{deal['collection']}</i>\n\n"
         f"💎 Prix actuel: <b>{deal['price']:.4f} TON</b>\n"
         f"📊 Floor price: {deal['floor']:.4f} TON\n"
-        f"{disc_emoji} Réduction: <b>-{deal['discount']:.1f}%</b>\n"
-        f"⭐ Score: {score_bar(deal['score'])} ({deal['score']}/100)\n\n"
+        f"🔥 Réduction: <b>-{discount:.1f}%</b>\n"
+        f"⭐ Score: {score_bar(score)} ({score}/100)\n"
+        f"{trend_str}\n\n"
         f"<i>⏰ {datetime.now().strftime('%H:%M:%S')}</i>"
     )
-    # Boutons : Acheter + Dashboard Mini App
+
     buttons = [[InlineKeyboardButton(text="🛒 Acheter sur GetGems", url=deal["link"])]]
     if MINI_APP_URL:
         buttons.append([InlineKeyboardButton(
@@ -458,6 +598,7 @@ async def send_alert(deal: dict):
             web_app=WebAppInfo(url=MINI_APP_URL),
         )])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -517,6 +658,9 @@ async def sniper_loop():
 
                     listings = await fetch_listings(session, slug)
 
+                    # Tendance du floor (hausse / baisse vs hier)
+                    trend = await get_floor_trend(slug)
+
                     for item in listings:
                         price = item["price_ton"]
                         if price <= 0 or price >= floor_ton:
@@ -531,8 +675,8 @@ async def sniper_loop():
                         if await is_already_alerted(address):
                             continue
 
-                        score    = compute_score(discount, floor_ton, volume_ton)
-                        priority = "high" if discount >= PRIORITY_THRESHOLD else "normal"
+                        score    = compute_score(discount, floor_ton, volume_ton, trend)
+                        priority = compute_priority(discount)
 
                         deal = {
                             "address":    address,
@@ -543,18 +687,21 @@ async def sniper_loop():
                             "discount":   round(discount, 1),
                             "score":      score,
                             "priority":   priority,
+                            "trend":      round(trend, 2),
                             "link":       item["link"],
                         }
 
+                        emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
                         log.info(
-                            f"{'🚨' if priority == 'high' else '💎'} {item['name']} "
+                            f"{emoji} {item['name']} "
                             f"@ {price:.4f} TON (floor {floor_ton:.4f}) "
-                            f"-{discount:.1f}% | score {score}"
+                            f"-{discount:.1f}% | score {score} | trend {trend:+.1f}%"
                         )
 
                         await send_alert(deal)
                         await mark_as_alerted(address, item["name"], col_name,
-                                               price, floor_ton, round(discount, 1))
+                                               price, floor_ton, round(discount, 1),
+                                               score=score, priority=priority)
                         deals_found += 1
 
                 except Exception as e:
@@ -590,40 +737,176 @@ def json_resp(data, status=200):
         headers=cors_headers(),
     )
 
-# ── Healthcheck ──
+# ── Healthcheck avancé ──
 async def handle_health(req):
     s = await get_stats()
-    return json_resp({"status": "OK", "scans": s.get("scans", 0), "alerts": s.get("alerts", 0)})
+    uptime_sec = int(time.time() - _BOT_START_TIME)
+    uptime_str = f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s"
+    try:
+        mem = psutil.Process().memory_info()
+        mem_mb = round(mem.rss / 1024 / 1024, 1)
+    except Exception:
+        mem_mb = 0
+    return json_resp({
+        "status": "OK",
+        "version": "2.0",
+        "uptime": uptime_str,
+        "uptimeSeconds": uptime_sec,
+        "memoryMb": mem_mb,
+        "totalScans": s.get("scans", 0),
+        "totalAlerts": s.get("alerts", 0),
+        "lastScan": s.get("last_scan"),
+        "thresholds": {
+            "deal": DEAL_THRESHOLD,
+            "hot": PRIORITY_THRESHOLD,
+            "extreme": EXTREME_THRESHOLD,
+        },
+    })
 
 # ── GET /api/deals ──
 async def handle_deals(req):
+    limit  = int(req.rel_url.query.get("limit", 50))
+    offset = int(req.rel_url.query.get("offset", 0))
+    prio   = req.rel_url.query.get("priority", "")   # normal|high|extreme
+    search = req.rel_url.query.get("q", "").lower()
+    min_score = int(req.rel_url.query.get("minScore", 0))
+
+    sql = """
+        SELECT rowid, nft_address, nft_name, collection,
+               price_ton, floor_ton, discount, alerted_at,
+               COALESCE(score, 0), COALESCE(priority, 'normal')
+        FROM alerted_nfts
+        WHERE 1=1
+    """
+    params: list = []
+    if prio:
+        sql += " AND COALESCE(priority,'normal') = ?"
+        params.append(prio)
+    if min_score:
+        sql += " AND COALESCE(score, 0) >= ?"
+        params.append(min_score)
+    sql += " ORDER BY alerted_at DESC LIMIT ? OFFSET ?"
+    params += [limit, offset]
+
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT rowid, nft_address, nft_name, collection,
-                   price_ton, floor_ton, discount, alerted_at
-            FROM alerted_nfts ORDER BY alerted_at DESC LIMIT 50
-        """) as cur:
+        async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
+
     deals = []
     for r in rows:
+        name_lc = (r[2] or "").lower()
+        coll_lc = (r[3] or "").lower()
+        if search and search not in name_lc and search not in coll_lc:
+            continue
         floor = r[5] or 1
         price = r[4] or 0
         disc  = r[6] or 0
-        score = compute_score(disc, floor, 0)
+        score = r[8] or compute_score(disc, floor, 0)
+        prio_val = r[9] or compute_priority(disc)
         deals.append({
-            "id": r[0],
-            "nftName": r[2],
+            "id":             r[0],
+            "nftName":        r[2],
             "collectionName": r[3],
-            "currentPrice": price,
-            "floorPrice": floor,
+            "currentPrice":   price,
+            "floorPrice":     floor,
             "discountPercent": round(disc, 1),
-            "score": score,
-            "priority": "high" if disc >= PRIORITY_THRESHOLD else "normal",
-            "link": f"https://getgems.io/nft/{r[1]}",
-            "imageUrl": None,
-            "detectedAt": r[7],
+            "score":          score,
+            "priority":       prio_val,
+            "link":           f"https://getgems.io/nft/{r[1]}",
+            "imageUrl":       None,
+            "detectedAt":     r[7],
         })
     return json_resp(deals)
+
+
+# ── GET /api/deals/history ──
+async def handle_deals_history(req):
+    limit  = int(req.rel_url.query.get("limit", 100))
+    offset = int(req.rel_url.query.get("offset", 0))
+    prio   = req.rel_url.query.get("priority", "")
+    since  = req.rel_url.query.get("since", "")   # ISO datetime
+
+    sql = """
+        SELECT rowid, nft_address, nft_name, collection,
+               price_ton, floor_ton, discount, alerted_at,
+               COALESCE(score, 0), COALESCE(priority, 'normal')
+        FROM alerted_nfts
+        WHERE 1=1
+    """
+    params: list = []
+    if prio:
+        sql += " AND COALESCE(priority,'normal') = ?"
+        params.append(prio)
+    if since:
+        sql += " AND alerted_at >= ?"
+        params.append(since)
+    sql += " ORDER BY alerted_at DESC LIMIT ? OFFSET ?"
+    params += [limit, offset]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM alerted_nfts") as cur:
+            total = (await cur.fetchone())[0]
+
+    items = [{
+        "id":             r[0],
+        "nftName":        r[2],
+        "collectionName": r[3],
+        "currentPrice":   r[4] or 0,
+        "floorPrice":     r[5] or 1,
+        "discountPercent": round(r[6] or 0, 1),
+        "score":          r[8],
+        "priority":       r[9],
+        "link":           f"https://getgems.io/nft/{r[1]}",
+        "detectedAt":     r[7],
+    } for r in rows]
+
+    return json_resp({"total": total, "items": items, "limit": limit, "offset": offset})
+
+
+# ── GET /api/stats/charts ──
+async def handle_stats_charts(req):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Deals par heure (24 dernières heures)
+        async with db.execute("""
+            SELECT strftime('%H:00', alerted_at) as hour, COUNT(*) as count
+            FROM alerted_nfts
+            WHERE alerted_at >= datetime('now', '-24 hours')
+            GROUP BY hour ORDER BY hour
+        """) as cur:
+            rows_hourly = await cur.fetchall()
+
+        # Deals par collection (top 10)
+        async with db.execute("""
+            SELECT collection, COUNT(*) as count
+            FROM alerted_nfts
+            GROUP BY collection ORDER BY count DESC LIMIT 10
+        """) as cur:
+            rows_coll = await cur.fetchall()
+
+        # Répartition priorité
+        async with db.execute("""
+            SELECT COALESCE(priority,'normal') as p, COUNT(*) as count
+            FROM alerted_nfts GROUP BY p
+        """) as cur:
+            rows_prio = await cur.fetchall()
+
+        # Évolution du floor par collection (7 derniers jours)
+        async with db.execute("""
+            SELECT slug, strftime('%Y-%m-%d', recorded_at) as day, AVG(floor_ton) as avg_floor
+            FROM floor_history
+            WHERE recorded_at >= datetime('now', '-7 days')
+            GROUP BY slug, day ORDER BY slug, day
+        """) as cur:
+            rows_trend = await cur.fetchall()
+
+    return json_resp({
+        "dealsPerHour":   [{"hour": r[0], "count": r[1]} for r in rows_hourly],
+        "dealsByCollection": [{"name": r[0], "count": r[1]} for r in rows_coll],
+        "priorityDistribution": [{"priority": r[0], "count": r[1]} for r in rows_prio],
+        "floorTrend": [{"slug": r[0], "day": r[1], "avgFloor": round(r[2], 4)} for r in rows_trend],
+    })
 
 # ── GET /api/deals/stats ──
 async def handle_deal_stats(req):
@@ -750,37 +1033,26 @@ async def handle_static(req):
     with open(file_path, "rb") as f:
         return aiohttp.web.Response(body=f.read(), content_type=mime)
 
-async def init_watchlist_table():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS watchlist (
-                collection_slug  TEXT UNIQUE,
-                collection_name  TEXT,
-                alert_threshold  INTEGER DEFAULT 40,
-                added_at         TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        await db.commit()
-
 async def start_web_server():
-    await init_watchlist_table()
     app = aiohttp.web.Application()
 
-    # API routes
-    app.router.add_get("/health",               handle_health)
-    app.router.add_get("/api/deals",            handle_deals)
-    app.router.add_get("/api/deals/stats",      handle_deal_stats)
-    app.router.add_get("/api/collections",      handle_collections)
-    app.router.add_get("/api/watchlist",        handle_watchlist_get)
-    app.router.add_post("/api/watchlist",       handle_watchlist_post)
-    app.router.add_delete("/api/watchlist/{id}", handle_watchlist_delete)
-    app.router.add_get("/api/bot/status",       handle_bot_status)
-    app.router.add_put("/api/bot/config",       handle_bot_config)
+    # ── API routes ───────────────────────────────────────────────────────
+    app.router.add_get("/health",                    handle_health)
+    app.router.add_get("/api/deals",                 handle_deals)
+    app.router.add_get("/api/deals/stats",           handle_deal_stats)
+    app.router.add_get("/api/deals/history",         handle_deals_history)
+    app.router.add_get("/api/stats/charts",          handle_stats_charts)
+    app.router.add_get("/api/collections",           handle_collections)
+    app.router.add_get("/api/watchlist",             handle_watchlist_get)
+    app.router.add_post("/api/watchlist",            handle_watchlist_post)
+    app.router.add_delete("/api/watchlist/{id}",     handle_watchlist_delete)
+    app.router.add_get("/api/bot/status",            handle_bot_status)
+    app.router.add_put("/api/bot/config",            handle_bot_config)
     app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
 
-    # Fichiers statiques React (tout le reste)
-    app.router.add_get("/",                     handle_static)
-    app.router.add_get("/{path_info:.*}",       handle_static)
+    # ── Fichiers statiques React (SPA routing) ───────────────────────────
+    app.router.add_get("/",                          handle_static)
+    app.router.add_get("/{path_info:.*}",            handle_static)
 
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
