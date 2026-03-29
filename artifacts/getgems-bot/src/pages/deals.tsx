@@ -26,6 +26,20 @@ function priorityLabel(p: string) {
   return                      { label: "🟢 DEAL",     color: TG_GREEN  };
 }
 
+function sourceInfo(src: string | undefined) {
+  if (src === "fragment")      return { label: "Fragment",      emoji: "💫", color: "#0088cc" };
+  if (src === "getgems_gift")  return { label: "TG Gift",       emoji: "🎁", color: "#bf5af2" };
+  if (src === "tonnel")        return { label: "Tonnel",         emoji: "🔵", color: "#30d158" };
+  return                              { label: "GetGems",        emoji: "💎", color: TG_BLUE  };
+}
+
+function buyButtonLabel(src: string | undefined) {
+  if (src === "fragment")     return "💫 Acheter sur Fragment";
+  if (src === "getgems_gift") return "🎁 Acheter sur GetGems";
+  if (src === "tonnel")       return "🔵 Acheter sur Tonnel";
+  return "🛒 Acheter sur GetGems";
+}
+
 function ScoreBadge({ score }: { score: number }) {
   const color = score >= 70 ? TG_GREEN : score >= 40 ? TG_ORANGE : TG_HINT;
   return (
@@ -60,6 +74,7 @@ function ScoreBar({ label, value, max, color }: { label: string; value: number; 
 
 function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
   const prio    = priorityLabel(deal.priority);
+  const src     = sourceInfo((deal as any).source);
   const savings = deal.floorPrice - deal.currentPrice;
   const [imgError, setImgError] = useState(false);
 
@@ -130,13 +145,17 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
             </button>
           </div>
 
-          {/* Badge priorité + score */}
-          <div className="flex items-center gap-2">
+          {/* Badge priorité + score + source */}
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs font-bold px-2.5 py-1 rounded-full"
               style={{ background: `${prio.color}22`, color: prio.color, border: `1px solid ${prio.color}44` }}>
               {prio.label}
             </span>
             <ScoreBadge score={deal.score} />
+            <span className="text-xs font-semibold px-2 py-1 rounded-full"
+              style={{ background: `${src.color}18`, color: src.color, border: `1px solid ${src.color}33` }}>
+              {src.emoji} {src.label}
+            </span>
           </div>
 
           {/* Prix */}
@@ -183,9 +202,9 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
           <button
             onClick={handleBuy}
             className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm active:scale-[0.98] transition-transform"
-            style={{ background: TG_BLUE, color: "#fff" }}
+            style={{ background: src.color, color: "#fff" }}
           >
-            🛒 Acheter sur GetGems
+            {buyButtonLabel((deal as any).source)}
           </button>
 
         </div>
@@ -198,6 +217,7 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
 
 function DealRow({ deal, onTap }: { deal: Deal; onTap: () => void }) {
   const prio = priorityLabel(deal.priority);
+  const src  = sourceInfo((deal as any).source);
   return (
     <motion.div
       className="tg-row items-start cursor-pointer active:scale-[0.98] transition-transform"
@@ -209,17 +229,21 @@ function DealRow({ deal, onTap }: { deal: Deal; onTap: () => void }) {
         style={{ background: "rgba(255,255,255,0.06)" }}>
         {deal.imageUrl
           ? <img src={deal.imageUrl} alt={deal.nftName} className="w-full h-full object-cover" />
-          : <span className="text-2xl">🎁</span>}
+          : <span className="text-2xl">{src.emoji}</span>}
       </div>
 
       {/* Info */}
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5 mb-0.5">
+        <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
           <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md"
             style={{ background: `${prio.color}20`, color: prio.color }}>
             {prio.label}
           </span>
           <ScoreBadge score={deal.score} />
+          <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-md"
+            style={{ background: `${src.color}18`, color: src.color }}>
+            {src.emoji} {src.label}
+          </span>
         </div>
 
         <p className="text-sm font-semibold truncate">{deal.nftName}</p>
