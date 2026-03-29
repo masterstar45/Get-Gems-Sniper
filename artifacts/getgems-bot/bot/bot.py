@@ -765,23 +765,6 @@ SPOTLIGHT_COLLECTIONS = [
 
 async def sniper_loop():
     log.info("🚀 Boucle de sniping démarrée (via TonAPI)")
-    if bot and TELEGRAM_CHAT_ID:
-        try:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=(
-                    f"🤖 <b>GetGems NFT Sniper démarré!</b>\n\n"
-                    f"⚙️ Config:\n"
-                    f"• Scan toutes les <b>{SCAN_INTERVAL}s</b>\n"
-                    f"• Deal si réduction ≥ <b>{DEAL_THRESHOLD}%</b>\n"
-                    f"• Priorité si réduction ≥ <b>{PRIORITY_THRESHOLD}%</b>\n"
-                    f"• Source: <b>TonAPI (officiel GetGems)</b>\n\n"
-                    f"📡 Découverte des collections en cours..."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            log.warning(f"Impossible d'envoyer le message de démarrage: {e}")
 
     connector = aiohttp.TCPConnector(ssl=False, limit=5)
     scan_count = 0
@@ -906,7 +889,6 @@ async def sniper_loop():
                             f"-{discount:.1f}% | score {score}"
                         )
 
-                        await send_alert(deal)
                         await mark_as_alerted(
                             address, item["name"], col_name,
                             price, floor_ton, round(discount, 1),

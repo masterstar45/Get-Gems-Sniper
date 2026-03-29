@@ -5,7 +5,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { haptic } from "@/hooks/useTelegram";
 import { useGetBotStatus } from "@workspace/api-client-react";
 import { useTonWallet } from "@/hooks/useTonWallet";
-import { useState } from "react";
+import { useDealsNotifier } from "@/hooks/useDealsNotifier";
+import { useState, useEffect } from "react";
 
 const TABS = [
   { href: "/",            label: "Deals",    icon: LayoutDashboard },
@@ -69,8 +70,15 @@ function WalletButton() {
 export function Layout({ children }: { children: React.ReactNode }) {
   const [location] = useLocation();
   const { data: botStatus } = useGetBotStatus({ query: { refetchInterval: 8000 } });
+  const { newCount, markAllSeen } = useDealsNotifier();
+
   const isActive = (href: string) =>
     href === "/" ? location === "/" : location.startsWith(href);
+
+  // Quand l'utilisateur ouvre l'onglet Deals, marque tout comme vu
+  useEffect(() => {
+    if (location === "/") markAllSeen();
+  }, [location, markAllSeen]);
 
   return (
     <div className="tg-app flex flex-col h-screen overflow-hidden">
@@ -121,18 +129,29 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <div className="flex items-stretch" style={{ minWidth: "max-content", width: "100%" }}>
           {TABS.map((tab) => {
             const active = isActive(tab.href);
+            const showBadge = tab.href === "/" && newCount > 0 && !active;
             return (
               <Link
                 key={tab.href}
                 href={tab.href}
-                onClick={() => haptic.select()}
+                onClick={() => { haptic.select(); if (tab.href === "/") markAllSeen(); }}
                 className={cn(
                   "relative flex flex-col items-center justify-center gap-0.5 py-2 transition-colors duration-150 select-none",
                   active ? "text-button" : "text-hint"
                 )}
                 style={{ minWidth: "52px", flex: "1 1 0" }}
               >
-                <tab.icon className={cn("w-4 h-4 transition-all duration-150", active && "scale-110")} />
+                <div className="relative">
+                  <tab.icon className={cn("w-4 h-4 transition-all duration-150", active && "scale-110")} />
+                  {showBadge && (
+                    <span
+                      className="absolute -top-1.5 -right-1.5 min-w-[14px] h-[14px] px-0.5 rounded-full flex items-center justify-center text-[8px] font-black"
+                      style={{ background: "#ff453a", color: "#fff", lineHeight: 1 }}
+                    >
+                      {newCount > 9 ? "9+" : newCount}
+                    </span>
+                  )}
+                </div>
                 <span className="text-[8px] font-semibold">{tab.label}</span>
                 {active && (
                   <motion.div
