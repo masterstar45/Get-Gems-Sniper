@@ -556,14 +556,25 @@ async def main():
         bot = Bot(token=TELEGRAM_TOKEN)
 
     await init_db()
+
+    # Keep-alive non-bloquant (se lance en arrière-plan)
     await start_keepalive_server()
 
-    tasks = [asyncio.create_task(sniper_loop())]
+    # Sniper tourne en arrière-plan dans tous les cas
+    asyncio.create_task(sniper_loop())
 
     if bot:
-        tasks.append(asyncio.create_task(dp.start_polling(bot)))
-
-    await asyncio.gather(*tasks)
+        log.info("🤖 Démarrage du polling Telegram (aiogram 3.x)...")
+        # start_polling DOIT être awaité directement en aiogram 3.x
+        # drop_pending_updates=True évite de traiter les vieux messages
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message"],
+            drop_pending_updates=True,
+        )
+    else:
+        # Pas de bot Telegram : on attend indéfiniment sur le sniper seul
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
