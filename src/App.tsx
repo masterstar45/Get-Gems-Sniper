@@ -67,6 +67,9 @@ function App() {
       tg.ready();
       tg.expand();
 
+      // Plein écran (Bot API 8.0+) — supprime le header Telegram
+      try { (tg as any).requestFullscreen(); } catch {}
+
       // Synchronise header et bottom bar avec le fond de l'app
       try { tg.setHeaderColor(bgColor as `#${string}`); } catch {}
       try { (tg as any).setBottomBarColor(bgColor); } catch {}
