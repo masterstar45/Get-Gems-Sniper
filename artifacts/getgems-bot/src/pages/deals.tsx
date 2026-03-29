@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect } from "react";
 import { useGetDeals, useGetDealStats, useGetBotStatus } from "@workspace/api-client-react";
-import type { Deal } from "@workspace/api-client-react";
+import type { Deal, BotStatus } from "@workspace/api-client-react";
 import { formatDistanceToNow } from "date-fns";
 import { fr } from "date-fns/locale";
 import { tg, haptic } from "@/hooks/useTelegram";
@@ -73,9 +73,15 @@ function FloorSparkline({ collectionName }: { collectionName: string }) {
         const r = await fetch(`${API_BASE}/api/trends?period=7d`);
         if (!r.ok) return;
         const json = await r.json();
+        const nameLower = collectionName.toLowerCase();
+        // Prefer exact name match, then partial match as fallback
         const col = (json.collections ?? []).find(
-          (c: { name: string; floorHistory: FloorPoint[] }) =>
-            c.name.toLowerCase() === collectionName.toLowerCase()
+          (c: { name: string; slug: string; floorHistory: FloorPoint[] }) =>
+            c.name.toLowerCase() === nameLower
+        ) ?? (json.collections ?? []).find(
+          (c: { name: string; slug: string; floorHistory: FloorPoint[] }) =>
+            c.name.toLowerCase().includes(nameLower) ||
+            nameLower.includes(c.name.toLowerCase())
         );
         if (!cancelled && col?.floorHistory?.length) {
           setData(col.floorHistory);
@@ -182,7 +188,7 @@ function DealDrawer({ deal, onClose }: { deal: DealEx; onClose: () => void }) {
 
   const handleBuy = () => {
     haptic.medium();
-    const url = (deal as any).buy_link || deal.link;
+    const url = deal.buy_link ?? deal.link;
     if (tg) {
       try { tg.openLink(url); } catch { window.open(url, "_blank"); }
     } else {
@@ -714,7 +720,7 @@ export default function DealsPage() {
               <div className="flex items-center gap-1.5 text-[10px] rounded-full px-3 py-1"
                 style={{ background: "rgba(48,209,88,0.1)", color: TG_GREEN }}>
                 <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-                {(botStatus as any).totalScans ?? 0} scans effectués
+                {(botStatus as BotStatus).totalScans ?? 0} scans effectués
               </div>
             )}
             {!hasFilters && (
