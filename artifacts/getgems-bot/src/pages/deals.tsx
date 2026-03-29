@@ -104,7 +104,8 @@ function DealDrawer({ deal, onClose }: { deal: Deal; onClose: () => void }) {
           <div className="w-10 h-1 rounded-full" style={{ background: "rgba(255,255,255,0.2)" }} />
         </div>
 
-        <div className="px-4 pb-8 space-y-4 max-h-[82vh] overflow-y-auto">
+        <div className="px-4 space-y-4 max-h-[82vh] overflow-y-auto"
+          style={{ paddingBottom: 'calc(2rem + env(safe-area-inset-bottom, 0px))' }}>
 
           {/* Header avec image */}
           <div className="flex items-center gap-3">
