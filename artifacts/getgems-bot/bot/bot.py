@@ -321,8 +321,8 @@ async def tonapi_get(session: aiohttp.ClientSession, path: str) -> dict | None:
     if TONAPI_KEY:
         headers["Authorization"] = f"Bearer {TONAPI_KEY}"
 
-    # Délai poli entre requêtes (réduit avec clé API)
-    await asyncio.sleep(0.3 if TONAPI_KEY else 1.1)
+    # Délai poli entre requêtes (réduit avec clé API, mais pas trop agressif)
+    await asyncio.sleep(0.5 if TONAPI_KEY else 1.2)
 
     for attempt in range(2):
         try:
@@ -332,9 +332,12 @@ async def tonapi_get(session: aiohttp.ClientSession, path: str) -> dict | None:
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 429:
-                    # Backoff sans bloquer tout le scan : on marque 60s d'attente
-                    wait = 60 if not TONAPI_KEY else 15
-                    log.warning(f"⏳ TonAPI 429 — pause {wait}s (ajoutez TONAPI_KEY pour lever la limite)")
+                    if TONAPI_KEY:
+                        wait = 20
+                        log.warning(f"⏳ TonAPI 429 (clé: free tier) — pause {wait}s")
+                    else:
+                        wait = 60
+                        log.warning(f"⏳ TonAPI 429 — pause {wait}s (sans clé API, limite basse)")
                     _tonapi_rate_limited_until = time.time() + wait
                     return None
                 if resp.status == 403:
