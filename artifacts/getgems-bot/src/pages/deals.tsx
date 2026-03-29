@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useGetDeals, useGetDealStats } from "@workspace/api-client-react";
+import { useGetDeals, useGetDealStats, useGetBotStatus } from "@workspace/api-client-react";
 import type { Deal } from "@workspace/api-client-react";
 import { formatDistanceToNow } from "date-fns";
 import { fr } from "date-fns/locale";
@@ -235,8 +235,15 @@ const PRIORITY_LABELS: Record<string, string> = {
 };
 
 export default function DealsPage() {
-  const { data: stats, isLoading: statsLoading } = useGetDealStats({ query: { refetchInterval: 10000 } });
-  const { data: deals, isLoading: dealsLoading } = useGetDeals({}, { query: { refetchInterval: 8000 } });
+  const { data: botStatus } = useGetBotStatus({ query: { refetchInterval: 8000 } });
+  const { data: stats, isLoading: statsLoading, refetch: refetchStats } = useGetDealStats({ query: { refetchInterval: 10000 } });
+  const { data: deals, isLoading: dealsLoading, refetch: refetchDeals, isFetching } = useGetDeals({}, { query: { refetchInterval: 8000 } });
+
+  const handleRefresh = () => {
+    haptic.medium();
+    refetchDeals();
+    refetchStats();
+  };
 
   const [search, setSearch]     = useState("");
   const [priority, setPriority] = useState<string>("");
@@ -397,16 +404,21 @@ export default function DealsPage() {
         </AnimatePresence>
       </div>
 
-      {/* ── En-tête liste ── */}
+      {/* ── En-tête liste + bouton refresh ── */}
       <div className="flex items-center justify-between px-1">
         <p className="text-sm font-bold">
           {filtered.length} opportunité{filtered.length > 1 ? "s" : ""}
           {hasFilters ? " (filtrées)" : ""}
         </p>
-        <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold"
-          style={{ background: "rgba(48,209,88,0.15)", color: TG_GREEN }}>
-          ⟳ Live
-        </span>
+        <button
+          onClick={handleRefresh}
+          disabled={isFetching}
+          className="flex items-center gap-1 text-[10px] px-2.5 py-1 rounded-full font-semibold transition-all active:scale-95"
+          style={{ background: "rgba(48,209,88,0.15)", color: TG_GREEN, border: "1px solid rgba(48,209,88,0.3)" }}
+        >
+          <span className={isFetching ? "animate-spin inline-block" : ""}>⟳</span>
+          {isFetching ? "Actualisation..." : "Actualiser"}
+        </button>
       </div>
 
       {/* ── Liste des deals ── */}
@@ -429,9 +441,25 @@ export default function DealsPage() {
             </p>
             <p className="text-xs text-center" style={{ color: TG_HINT }}>
               {hasFilters
-                ? "Essayez d'élargir vos filtres."
+                ? "Essayez d'élargir vos filtres ou de baisser le seuil minimum."
                 : "Le bot scanne en continu. Les deals apparaissent dès détection."}
             </p>
+            {!hasFilters && botStatus && (
+              <div className="flex items-center gap-1.5 text-[10px] rounded-full px-3 py-1"
+                style={{ background: "rgba(48,209,88,0.1)", color: TG_GREEN }}>
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+                {(botStatus as any).totalScans ?? (botStatus as any).scan_count ?? 0} scans effectués
+              </div>
+            )}
+            {!hasFilters && (
+              <button
+                onClick={handleRefresh}
+                className="text-xs px-4 py-1.5 rounded-full font-semibold mt-1 transition-all active:scale-95"
+                style={{ background: "var(--tg-theme-button-color)", color: "var(--tg-theme-button-text-color)" }}
+              >
+                Vérifier maintenant
+              </button>
+            )}
           </div>
         ) : (
           filtered.map((deal) => (

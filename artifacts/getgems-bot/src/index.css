@@ -93,10 +93,12 @@
     height: 100dvh;   /* dynamic viewport height (respecte la barre du bas Telegram) */
   }
 
-  /* Header */
+  /* Header — padding-top couvre la status bar en mode plein écran */
   .tg-header {
     background-color: var(--tg-theme-secondary-bg-color);
     border-bottom: 1px solid rgba(255,255,255,0.06);
+    /* Ajoute la hauteur de la status bar au-dessus du padding normal (0.625rem) */
+    padding-top: calc(0.625rem + env(safe-area-inset-top, 0px));
   }
 
   /* Barre de navigation basse */

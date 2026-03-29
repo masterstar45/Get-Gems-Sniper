@@ -1,0 +1,18 @@
+packages:
+  "framer-motion": "For premium page transitions, micro-interactions, and fluid layout animations"
+  "date-fns": "For formatting timestamps"
+  "clsx": "For conditional class merging"
+  "tailwind-merge": "For conditional class merging with Tailwind"
+  "lucide-react": "Icons for the dashboard"
+
+images:
+  - path: "artifacts/getgems-bot/public/images/crypto-bg.png"
+    description: "Abstract, dark, sleek crypto background with glowing cyan and deep blue neon geometric lines, extremely high quality, dark mode, 8k resolution"
+    aspect_ratio: "16:9"
+  - path: "artifacts/getgems-bot/public/images/bot-avatar.png"
+    description: "A highly stylized, modern 3D icon of a futuristic robot head with glowing blue eyes, dark theme, isolated on dark background"
+    aspect_ratio: "1:1"
+
+notes:
+  - Using @workspace/api-client-react for generated TanStack Query hooks.
+  - Assuming absolute paths for wouter routing.

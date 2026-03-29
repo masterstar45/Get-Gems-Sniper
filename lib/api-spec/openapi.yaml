@@ -1,0 +1,358 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: GetGems NFT Bot Dashboard API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: deals
+    description: NFT deal alerts
+  - name: watchlist
+    description: User watchlist
+  - name: collections
+    description: NFT collections floor prices
+  - name: bot
+    description: Bot configuration and status
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /deals:
+    get:
+      operationId: getDeals
+      tags: [deals]
+      summary: Get recent NFT deals
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: number
+          description: Max number of deals to return
+        - name: priority
+          in: query
+          schema:
+            type: string
+            enum: [all, high, normal]
+          description: Filter by priority level
+      responses:
+        "200":
+          description: List of NFT deals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Deal"
+
+  /deals/stats:
+    get:
+      operationId: getDealStats
+      tags: [deals]
+      summary: Get deal statistics
+      responses:
+        "200":
+          description: Deal statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DealStats"
+
+  /watchlist:
+    get:
+      operationId: getWatchlist
+      tags: [watchlist]
+      summary: Get user watchlist
+      responses:
+        "200":
+          description: List of watchlist items
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WatchlistItem"
+    post:
+      operationId: addToWatchlist
+      tags: [watchlist]
+      summary: Add collection to watchlist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddWatchlistItem"
+      responses:
+        "201":
+          description: Added to watchlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatchlistItem"
+
+  /watchlist/{id}:
+    delete:
+      operationId: removeFromWatchlist
+      tags: [watchlist]
+      summary: Remove item from watchlist
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /collections:
+    get:
+      operationId: getCollections
+      tags: [collections]
+      summary: Get tracked collections with floor prices
+      responses:
+        "200":
+          description: List of collections
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Collection"
+
+  /bot/status:
+    get:
+      operationId: getBotStatus
+      tags: [bot]
+      summary: Get bot status and configuration
+      responses:
+        "200":
+          description: Bot status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+
+  /bot/config:
+    put:
+      operationId: updateBotConfig
+      tags: [bot]
+      summary: Update bot configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotConfig"
+      responses:
+        "200":
+          description: Updated config
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    Deal:
+      type: object
+      properties:
+        id:
+          type: number
+        nftName:
+          type: string
+        collectionName:
+          type: string
+        currentPrice:
+          type: number
+        floorPrice:
+          type: number
+        discountPercent:
+          type: number
+        score:
+          type: number
+        priority:
+          type: string
+          enum: [high, normal]
+        link:
+          type: string
+        imageUrl:
+          type: string
+        detectedAt:
+          type: string
+        isActive:
+          type: boolean
+      required:
+        - id
+        - nftName
+        - collectionName
+        - currentPrice
+        - floorPrice
+        - discountPercent
+        - score
+        - priority
+        - link
+        - detectedAt
+        - isActive
+
+    DealStats:
+      type: object
+      properties:
+        totalDeals:
+          type: number
+        highPriorityDeals:
+          type: number
+        avgDiscount:
+          type: number
+        totalCollections:
+          type: number
+        lastScanAt:
+          type: string
+        botRunning:
+          type: boolean
+      required:
+        - totalDeals
+        - highPriorityDeals
+        - avgDiscount
+        - totalCollections
+        - lastScanAt
+        - botRunning
+
+    WatchlistItem:
+      type: object
+      properties:
+        id:
+          type: number
+        collectionSlug:
+          type: string
+        collectionName:
+          type: string
+        addedAt:
+          type: string
+        alertThreshold:
+          type: number
+      required:
+        - id
+        - collectionSlug
+        - collectionName
+        - addedAt
+        - alertThreshold
+
+    AddWatchlistItem:
+      type: object
+      properties:
+        collectionSlug:
+          type: string
+        collectionName:
+          type: string
+        alertThreshold:
+          type: number
+      required:
+        - collectionSlug
+        - collectionName
+        - alertThreshold
+
+    Collection:
+      type: object
+      properties:
+        id:
+          type: number
+        slug:
+          type: string
+        name:
+          type: string
+        floorPrice:
+          type: number
+        volume24h:
+          type: number
+        itemCount:
+          type: number
+        updatedAt:
+          type: string
+      required:
+        - id
+        - slug
+        - name
+        - floorPrice
+        - updatedAt
+
+    BotStatus:
+      type: object
+      properties:
+        isRunning:
+          type: boolean
+        telegramToken:
+          type: string
+        chatId:
+          type: string
+        scanInterval:
+          type: number
+        dealThreshold:
+          type: number
+        priorityThreshold:
+          type: number
+        totalScans:
+          type: number
+        totalAlertsSet:
+          type: number
+        lastActivity:
+          type: string
+      required:
+        - isRunning
+        - scanInterval
+        - dealThreshold
+        - priorityThreshold
+
+    BotConfig:
+      type: object
+      properties:
+        telegramToken:
+          type: string
+        chatId:
+          type: string
+        scanInterval:
+          type: number
+        dealThreshold:
+          type: number
+        priorityThreshold:
+          type: number
+      required:
+        - scanInterval
+        - dealThreshold
+        - priorityThreshold
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+        - message
