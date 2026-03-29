@@ -29,33 +29,57 @@ from fake_useragent import UserAgent
 
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "7"))          # secondes entre scans
-DEAL_THRESHOLD     = float(os.getenv("DEAL_THRESHOLD", "30"))      # % réduction → deal normal
-PRIORITY_THRESHOLD = float(os.getenv("PRIORITY_THRESHOLD", "50"))  # % réduction → deal hot
-EXTREME_THRESHOLD  = float(os.getenv("EXTREME_THRESHOLD", "70"))   # % réduction → deal extrême
+SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))         # secondes entre scans
+DEAL_THRESHOLD     = float(os.getenv("DEAL_THRESHOLD", "15"))      # % réduction → deal normal
+PRIORITY_THRESHOLD = float(os.getenv("PRIORITY_THRESHOLD", "40"))  # % réduction → deal hot
+EXTREME_THRESHOLD  = float(os.getenv("EXTREME_THRESHOLD", "60"))   # % réduction → deal extrême
 DB_PATH            = os.getenv("DB_PATH", "sniper.db")
 KEEPALIVE_PORT     = int(os.getenv("PORT", "8080"))
 MINI_APP_URL       = os.getenv("MINI_APP_URL", "")
 
+# Clé TonAPI optionnelle (https://tonconsole.com → rate limits bien supérieurs)
+TONAPI_KEY = os.getenv("TONAPI_KEY", "")
+
+# Nombre max de collections scannées par cycle (évite le rate-limit TonAPI)
+MAX_COLLECTIONS_PER_CYCLE = int(os.getenv("MAX_COLLECTIONS_PER_CYCLE", "30"))
+
 # Timestamp de démarrage (pour uptime)
 _BOT_START_TIME = time.time()
 
-# API GraphQL GetGems (endpoint officiel, sans clé)
-GETGEMS_GQL = "https://api.getgems.io/graphql"
+# TonAPI — source officielle recommandée par GetGems pour l'accès programmatique
+TONAPI_BASE = "https://tonapi.io/v2"
 
-# Collections de Gifts/NFTs à surveiller
-COLLECTIONS = [
-    "ton-gifts",
-    "telegram-gifts",
-    "getgems-gifts",
-    "the-open-league",
-    "ton-whales",
-    "ton-punks",
-    "mega-ton-whale",
-    "animals-nft",
-    "toncoin-gifts",
-    "getgems-nft",
+# Adresses de collections GetGems connues (seed manuel, complétées automatiquement)
+# Format: adresses TON 0:xxx ou EQxxx
+KNOWN_COLLECTION_ADDRESSES: list[str] = [
+    addr.strip()
+    for addr in os.getenv("EXTRA_COLLECTIONS", "").split(",")
+    if addr.strip()
 ]
+
+# Cache des collections découvertes dynamiquement (mis à jour toutes les 30 min)
+_discovered_collections: list[dict] = []
+_last_discovery: float = 0.0
+
+# Diagnostics du dernier cycle de scan (exposé via /api/debug/scan)
+_scan_diagnostics: dict = {
+    "cycle": 0,
+    "collections_total": 0,
+    "collections_scanned": 0,
+    "collections_with_listings": 0,
+    "items_fetched": 0,
+    "items_getgems": 0,
+    "items_below_floor": 0,
+    "items_qualifying": 0,
+    "deals_found": 0,
+    "tonapi_errors": 0,
+    "tonapi_rate_limited": False,
+    "last_collection_scanned": "",
+    "last_collection_listings": 0,
+    "sample_prices": [],
+    "sample_floor": 0.0,
+    "ts": 0.0,
+}
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -128,6 +152,17 @@ async def init_db():
                 alert_threshold  INTEGER DEFAULT 40,
                 added_at         TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS news (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                title        TEXT NOT NULL,
+                url          TEXT UNIQUE,
+                summary      TEXT,
+                source       TEXT,
+                category     TEXT DEFAULT 'ecosystem',
+                published_at TEXT,
+                fetched_at   TEXT DEFAULT (datetime('now'))
+            );
         """)
         # Migrations sans-casse (colonnes ajoutées si absentes)
         for col_def in [
@@ -184,6 +219,18 @@ async def save_floor_history(slug: str, floor_ton: float):
             WHERE slug = ? AND recorded_at < datetime('now', '-30 days')
         """, (slug,))
         await db.commit()
+
+async def auto_add_to_watchlist(slug: str, name: str, threshold: int = 0) -> None:
+    """Ajoute automatiquement une collection à la watchlist si elle n'y est pas déjà."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO watchlist
+               (collection_slug, collection_name, alert_threshold, added_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            (slug, name, threshold or int(DEAL_THRESHOLD)),
+        )
+        await db.commit()
+
 
 async def get_floor_trend(slug: str) -> float:
     """Retourne le % de variation du floor vs il y a 24h (positif = hausse, négatif = baisse)."""
@@ -257,128 +304,158 @@ async def get_recent_alerts(limit: int = 5) -> list[dict]:
                 for r in rows
             ]
 
-# ─── GRAPHQL CLIENT ───────────────────────────────────────────────────────────
+# ─── TONAPI CLIENT (source officielle recommandée par GetGems) ────────────────
 
-def gql_headers() -> dict:
-    return {
-        "User-Agent": get_ua(),
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": "https://getgems.io",
-        "Referer": "https://getgems.io/",
-    }
+_tonapi_rate_limited_until: float = 0.0  # timestamp jusqu'auquel on attend
 
-async def gql_request(session: aiohttp.ClientSession, query: str, variables: dict = {}) -> dict | None:
-    """POST GraphQL avec retry et délai aléatoire anti-ban."""
-    for attempt in range(3):
+async def tonapi_get(session: aiohttp.ClientSession, path: str) -> dict | None:
+    """GET vers TonAPI avec clé optionnelle et gestion fine du rate-limit."""
+    global _tonapi_rate_limited_until
+
+    # Si on sait qu'on est rate-limité, on ne fait pas de requête inutile
+    if time.time() < _tonapi_rate_limited_until:
+        return None
+
+    url = f"{TONAPI_BASE}{path}"
+    headers = {"Accept": "application/json", "User-Agent": get_ua()}
+    if TONAPI_KEY:
+        headers["Authorization"] = f"Bearer {TONAPI_KEY}"
+
+    # Délai poli entre requêtes (réduit avec clé API)
+    await asyncio.sleep(0.3 if TONAPI_KEY else 1.1)
+
+    for attempt in range(2):
         try:
-            await asyncio.sleep(random.uniform(0.3, 1.5))
-            async with session.post(
-                GETGEMS_GQL,
-                json={"query": query, "variables": variables},
-                headers=gql_headers(),
-                timeout=aiohttp.ClientTimeout(total=12),
-                ssl=False,
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 429:
-                    log.warning("⏳ Rate limited — pause 15s")
-                    await asyncio.sleep(15)
-                    continue
+                    # Backoff sans bloquer tout le scan : on marque 60s d'attente
+                    wait = 60 if not TONAPI_KEY else 15
+                    log.warning(f"⏳ TonAPI 429 — pause {wait}s (ajoutez TONAPI_KEY pour lever la limite)")
+                    _tonapi_rate_limited_until = time.time() + wait
+                    return None
+                if resp.status == 403:
+                    log.warning("🔒 TonAPI 403 — vérifiez TONAPI_KEY ou IP bloquée")
+                    return None
                 if resp.status != 200:
-                    log.debug(f"GQL HTTP {resp.status}")
-                    continue
-                data = await resp.json()
-                return data.get("data")
+                    log.debug(f"TonAPI {path} → HTTP {resp.status}")
+                    return None
+                return await resp.json()
         except asyncio.TimeoutError:
-            log.debug(f"Timeout (essai {attempt + 1})")
-            await asyncio.sleep(2 ** attempt)
+            log.debug(f"TonAPI timeout (essai {attempt + 1}): {path}")
+            if attempt == 0:
+                await asyncio.sleep(3)
         except Exception as e:
-            log.debug(f"Erreur réseau: {e} (essai {attempt + 1})")
-            await asyncio.sleep(2 ** attempt)
+            log.debug(f"TonAPI erreur: {e}")
+            break
     return None
 
-# ─── REQUÊTES GETGEMS ─────────────────────────────────────────────────────────
+# ─── DÉCOUVERTE DES COLLECTIONS GETGEMS VIA TONAPI ───────────────────────────
 
-QUERY_FLOOR = """
-query CollectionFloor($slug: String!) {
-    alphaNftCollection(slug: $slug) {
-        name
-        approximateCount
-        floorPrice
-        volume24h
-    }
-}
-"""
+async def discover_getgems_collections(session: aiohttp.ClientSession, pages: int = 5) -> list[dict]:
+    """
+    Parcourt TonAPI pour trouver toutes les collections GetGems.
+    Filtre sur metadata.marketplace == 'getgems.io'.
+    """
+    global _discovered_collections, _last_discovery
+    found: list[dict] = []
 
-QUERY_LISTINGS = """
-query CollectionListings($slug: String!, $first: Int!) {
-    alphaNftItems(
-        collectionSlug: $slug
-        first: $first
-        filter: { saleStatus: forSale }
-        sort: { price: asc }
-    ) {
-        edges {
-            node {
-                address
-                name
-                previews { url }
-                sale {
-                    ... on NftSaleFixPrice {
-                        fullPrice
-                    }
-                }
-            }
-        }
-    }
-}
-"""
+    for page in range(pages):
+        offset = page * 200
+        data = await tonapi_get(session, f"/nfts/collections?limit=200&offset={offset}")
+        if not data:
+            break
+        batch = data.get("nft_collections", [])
+        if not batch:
+            break
 
-async def fetch_floor(session: aiohttp.ClientSession, slug: str) -> tuple[str, float, float, int] | None:
-    """Retourne (name, floor_ton, volume_ton, item_count) ou None."""
-    cached = await get_cached_floor(slug)
-    if cached is not None:
-        return (slug, cached, 0.0, 0)
+        for col in batch:
+            marketplace = (col.get("metadata") or {}).get("marketplace", "")
+            if "getgems" in marketplace.lower():
+                found.append(col)
 
-    data = await gql_request(session, QUERY_FLOOR, {"slug": slug})
-    if not data or not data.get("alphaNftCollection"):
-        return None
+        if len(batch) < 200:
+            break  # Dernière page
 
-    col = data["alphaNftCollection"]
-    floor_ton  = int(col.get("floorPrice") or 0) / 1e9
-    volume_ton = int(col.get("volume24h")  or 0) / 1e9
-    count      = col.get("approximateCount", 0)
-    name       = col.get("name", slug)
+    # Ajoute aussi les collections connues (env EXTRA_COLLECTIONS)
+    for addr in KNOWN_COLLECTION_ADDRESSES:
+        if not any(c.get("address") == addr for c in found):
+            found.append({"address": addr, "metadata": {"name": addr[:16]}})
 
-    if floor_ton <= 0:
-        return None
+    _discovered_collections = found
+    _last_discovery = time.time()
+    log.info(f"📦 {len(found)} collections GetGems découvertes via TonAPI")
+    return found
 
-    await cache_floor(slug, name, floor_ton, volume_ton, count)
-    return (name, floor_ton, volume_ton, count)
+async def get_collection_listings(session: aiohttp.ClientSession, col_address: str) -> list[dict]:
+    """
+    Récupère tous les NFTs en vente sur GetGems pour une collection donnée.
+    Utilise la pagination TonAPI. Filtre sur sale.market.name contenant 'getgems'.
+    """
+    listings: list[dict] = []
+    offset = 0
+    limit  = 200
 
-async def fetch_listings(session: aiohttp.ClientSession, slug: str, limit: int = 30) -> list[dict]:
-    """Retourne la liste des NFTs en vente triés par prix croissant."""
-    data = await gql_request(session, QUERY_LISTINGS, {"slug": slug, "first": limit})
-    if not data or "alphaNftItems" not in data:
-        return []
+    while True:
+        data = await tonapi_get(
+            session, f"/nfts/collections/{col_address}/items?limit={limit}&offset={offset}"
+        )
+        if not data:
+            break
 
-    items = []
-    for edge in data["alphaNftItems"].get("edges", []):
-        node  = edge.get("node", {})
-        sale  = node.get("sale", {})
-        price = int(sale.get("fullPrice", 0) or 0)
-        if price == 0:
-            continue
-        previews  = node.get("previews", [])
-        image_url = previews[-1]["url"] if previews else ""
-        items.append({
-            "address":   node.get("address", ""),
-            "name":      node.get("name", "NFT"),
-            "price_ton": price / 1e9,
-            "image_url": image_url,
-            "link":      f"https://getgems.io/nft/{node.get('address', '')}",
-        })
-    return items
+        items = data.get("nft_items", [])
+        if not items:
+            break
+
+        for item in items:
+            sale = item.get("sale")
+            if not sale:
+                continue
+
+            # Filtre GetGems uniquement
+            market_name = (sale.get("market") or {}).get("name", "")
+            if "getgems" not in market_name.lower():
+                continue
+
+            price_nano = int((sale.get("price") or {}).get("value", 0) or 0)
+            if price_nano <= 0:
+                continue
+
+            price_ton = price_nano / 1e9
+            previews  = item.get("previews") or []
+            image_url = previews[-1]["url"] if previews else ""
+
+            listings.append({
+                "address":   item.get("address", ""),
+                "name":      (item.get("metadata") or {}).get("name", "NFT"),
+                "price_ton": price_ton,
+                "image_url": image_url,
+                "link":      f"https://getgems.io/nft/{item.get('address', '')}",
+            })
+
+        if len(items) < limit:
+            break
+        offset += limit
+
+    return listings
+
+def compute_virtual_floor(listings: list[dict]) -> float:
+    """
+    Calcule un floor price 'réel' à partir des listings d'une collection.
+    Stratégie: médiane des prix → évite les outliers bas isolés.
+    Un item est un deal s'il est X% sous la médiane.
+    """
+    if not listings:
+        return 0.0
+    prices = sorted(l["price_ton"] for l in listings)
+    n = len(prices)
+    # Médiane
+    if n % 2 == 0:
+        return (prices[n // 2 - 1] + prices[n // 2]) / 2
+    return prices[n // 2]
 
 # ─── SCORING v2 (0–100) ──────────────────────────────────────────────────────
 
@@ -466,93 +543,12 @@ def _webapp_keyboard() -> InlineKeyboardMarkup | None:
 async def cmd_start(message: types.Message):
     kb = _webapp_keyboard()
     await message.answer(
-        "🤖 <b>GetGems NFT Sniper actif!</b>\n\n"
-        "Je surveille les NFT sous-évalués sur GetGems en temps réel et t'envoie une alerte dès qu'une opportunité est détectée.\n\n"
-        "📋 <b>Commandes:</b>\n"
-        "• /app — Ouvrir le dashboard complet 📊\n"
-        "• /deals — Derniers deals détectés\n"
-        "• /watchlist — Collections surveillées\n"
-        "• /stats — Statistiques du bot\n"
-        "• /floor &lt;slug&gt; — Floor d'une collection",
+        "💎 <b>GetGems NFT Sniper</b>\n\n"
+        "Je surveille les NFT sous-évalués sur GetGems en temps réel.\n"
+        "Ouvre le dashboard pour voir les deals, les tendances et configurer le bot.",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
-
-
-@dp.message(Command("app"))
-async def cmd_app(message: types.Message):
-    kb = _webapp_keyboard()
-    if not kb:
-        await message.answer(
-            "⚠️ Le dashboard n'est pas encore configuré.\n"
-            "Définissez la variable d'environnement <code>MINI_APP_URL</code> avec l'URL de votre déploiement.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    await message.answer(
-        "📊 <b>GetGems Sniper — Dashboard</b>\n\n"
-        "Consultez les deals en temps réel, gérez vos collections et configurez le bot directement depuis Telegram.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
-
-@dp.message(Command("deals"))
-async def cmd_deals(message: types.Message):
-    alerts = await get_recent_alerts(5)
-    if not alerts:
-        await message.answer("Aucun deal trouvé pour l'instant. Le bot scanne en continu...")
-        return
-    for a in alerts[:3]:
-        await message.answer(
-            f"💎 <b>{a['name']}</b>\n"
-            f"📂 {a['collection']}\n"
-            f"Prix: <b>{a['price']:.4f} TON</b> | Floor: {a['floor']:.4f} TON\n"
-            f"🔥 Réduction: <b>-{a['discount']:.1f}%</b>\n"
-            f"<a href='https://getgems.io/nft/{a['address']}'>👉 Voir sur GetGems</a>",
-            parse_mode=ParseMode.HTML,
-        )
-
-@dp.message(Command("watchlist"))
-async def cmd_watchlist(message: types.Message):
-    text = "📋 <b>Collections surveillées:</b>\n\n"
-    for slug in COLLECTIONS:
-        text += f"• <code>{slug}</code>\n"
-    text += f"\n<i>Seuil deal: -{DEAL_THRESHOLD}% | Priorité: -{PRIORITY_THRESHOLD}%</i>"
-    await message.answer(text, parse_mode=ParseMode.HTML)
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    s = await get_stats()
-    await message.answer(
-        f"📊 <b>Statistiques:</b>\n"
-        f"Scans effectués: <b>{s.get('scans', 0)}</b>\n"
-        f"Alertes envoyées: <b>{s.get('alerts', 0)}</b>\n"
-        f"Dernier scan: <b>{s.get('last_scan', 'N/A')}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-@dp.message(Command("floor"))
-async def cmd_floor(message: types.Message):
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.answer("Usage: /floor &lt;collection-slug&gt;", parse_mode=ParseMode.HTML)
-        return
-    slug = parts[1].strip()
-    await message.answer(f"🔍 Recherche du floor pour <code>{slug}</code>...", parse_mode=ParseMode.HTML)
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        result = await fetch_floor(session, slug)
-        if result:
-            name, floor, volume, count = result
-            await message.answer(
-                f"📊 <b>{name}</b>\n"
-                f"Floor: <b>{floor:.4f} TON</b>\n"
-                f"Volume 24h: {volume:.2f} TON\n"
-                f"Items: {count}",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await message.answer(f"❌ Collection <code>{slug}</code> introuvable.", parse_mode=ParseMode.HTML)
 
 async def send_alert(deal: dict):
     if not bot or not TELEGRAM_CHAT_ID:
@@ -610,10 +606,162 @@ async def send_alert(deal: dict):
     except Exception as e:
         log.error(f"Erreur envoi Telegram: {e}")
 
+# ─── ACTUALITÉS TON GIFTS ─────────────────────────────────────────────────────
+
+import xml.etree.ElementTree as _ET
+
+INITIAL_NEWS = [
+    {
+        "title": "TON Gifts : 2,18M de détenteurs et 312M$ de volume total",
+        "url": "https://ton.org/en/blog/ton-gifts-milestone",
+        "summary": "L'écosystème TON Gifts a atteint des sommets historiques en novembre 2025 avec 2,18 millions de détenteurs et 312,2 millions de dollars de volume de négociation total sur la blockchain TON.",
+        "source": "TON Foundation",
+        "category": "milestone",
+        "published_at": "2025-11-15T00:00:00",
+    },
+    {
+        "title": "Khabib Nurmagomedov lance la collection NFT Papakha sur Telegram",
+        "url": "https://getgems.io/collection/papakha",
+        "summary": "La légende du MMA Khabib Nurmagomedov lance la collection 'Papakha', qui devient virale et booste le volume global des TON Gifts à des niveaux records.",
+        "source": "GetGems",
+        "category": "launch",
+        "published_at": "2025-11-10T00:00:00",
+    },
+    {
+        "title": "Les TON Gifts deviennent des NFT échangeables sur la blockchain TON",
+        "url": "https://telegram.org/blog/gifts",
+        "summary": "Telegram étend les fonctionnalités : les cadeaux collectibles peuvent être portés comme statuts emoji, transférés ou mis aux enchères via la blockchain TON. Paiement en TON ou Stars.",
+        "source": "Telegram",
+        "category": "feature",
+        "published_at": "2025-10-01T00:00:00",
+    },
+    {
+        "title": "Crafting NFT : combiner des cadeaux Telegram pour en créer de nouveaux",
+        "url": "https://ton.org/en/blog/gifts-crafting",
+        "summary": "Des rumeurs et indices officiels pointent vers un système de 'crafting' permettant de fusionner plusieurs cadeaux existants pour générer des NFT exclusifs plus rares.",
+        "source": "TON Ecosystem",
+        "category": "rumor",
+        "published_at": "2025-12-01T00:00:00",
+    },
+    {
+        "title": "Toncoin accepté comme paiement secondaire pour les TON Gifts",
+        "url": "https://telegram.org/blog/toncoin-gifts",
+        "summary": "Telegram officialise l'utilisation du Toncoin (TON) comme option de paiement pour les transactions de cadeaux numériques, en complément des Telegram Stars.",
+        "source": "Telegram",
+        "category": "feature",
+        "published_at": "2025-09-15T00:00:00",
+    },
+]
+
+RSS_SOURCES = [
+    ("https://cointelegraph.com/rss/tag/ton",        "CoinTelegraph"),
+    ("https://decrypt.co/feed/tag/ton",              "Decrypt"),
+]
+
+async def seed_initial_news():
+    """Insère les actualités initiales si la table est vide."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM news") as cur:
+            count = (await cur.fetchone())[0]
+        if count == 0:
+            for n in INITIAL_NEWS:
+                await db.execute("""
+                    INSERT OR IGNORE INTO news (title, url, summary, source, category, published_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (n["title"], n["url"], n["summary"], n["source"], n["category"], n["published_at"]))
+            await db.commit()
+            log.info(f"✅ {len(INITIAL_NEWS)} actualités initiales insérées")
+
+async def fetch_rss_news(session: aiohttp.ClientSession):
+    """Tente de récupérer les dernières actualités depuis les flux RSS."""
+    for url, source_name in RSS_SOURCES:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    continue
+                text = await resp.text()
+            root = _ET.fromstring(text)
+            ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+            channel = root.find("channel")
+            if channel is None:
+                continue
+            items = channel.findall("item")[:10]
+            async with aiosqlite.connect(DB_PATH) as db:
+                inserted = 0
+                for item in items:
+                    title = (item.findtext("title") or "").strip()
+                    link  = (item.findtext("link")  or "").strip()
+                    desc  = (item.findtext("description") or "").strip()[:400]
+                    pubdate = (item.findtext("pubDate") or "").strip()
+                    if not title or not link:
+                        continue
+                    try:
+                        await db.execute("""
+                            INSERT OR IGNORE INTO news (title, url, summary, source, category, published_at)
+                            VALUES (?, ?, ?, ?, 'ecosystem', ?)
+                        """, (title, link, desc, source_name, pubdate))
+                        inserted += 1
+                    except Exception:
+                        pass
+                await db.commit()
+            log.info(f"📰 RSS {source_name}: {inserted} article(s) importé(s)")
+        except Exception as e:
+            log.debug(f"RSS {source_name} inaccessible: {e}")
+
+_last_news_fetch: float = 0.0
+
+async def maybe_refresh_news(session: aiohttp.ClientSession):
+    global _last_news_fetch
+    if time.time() - _last_news_fetch > 3600:
+        _last_news_fetch = time.time()
+        await fetch_rss_news(session)
+
+
+# ─── COLLECTIONS SPOTLIGHT (TON Gifts curatées) ───────────────────────────────
+
+SPOTLIGHT_COLLECTIONS = [
+    {
+        "name": "Papakha by Khabib",
+        "url": "https://getgems.io/collection/papakha",
+        "description": "Collection lancée par la légende du MMA Khabib Nurmagomedov",
+        "category": "celebrity",
+        "emoji": "🥊",
+    },
+    {
+        "name": "Telegram Gifts",
+        "url": "https://getgems.io/?filter=gifts",
+        "description": "Cadeaux Telegram convertis en NFT échangeables sur la blockchain TON",
+        "category": "official",
+        "emoji": "🎁",
+    },
+    {
+        "name": "TON Punks",
+        "url": "https://getgems.io/collection/ton-punks",
+        "description": "La collection OG de l'écosystème TON — référence de liquidité",
+        "category": "og",
+        "emoji": "👾",
+    },
+    {
+        "name": "Getgems Anonymous",
+        "url": "https://getgems.io/collection/getgems-anonymous",
+        "description": "Collection phare de la marketplace GetGems",
+        "category": "og",
+        "emoji": "🎭",
+    },
+    {
+        "name": "TON Diamonds",
+        "url": "https://getgems.io/collection/ton-diamonds",
+        "description": "NFT de haute valeur — floor élevé, fort potentiel de plus-value",
+        "category": "premium",
+        "emoji": "💎",
+    },
+]
+
+
 # ─── BOUCLE DE SNIPING ────────────────────────────────────────────────────────
 
 async def sniper_loop():
-    log.info("🚀 Boucle de sniping démarrée")
+    log.info("🚀 Boucle de sniping démarrée (via TonAPI)")
     if bot and TELEGRAM_CHAT_ID:
         try:
             await bot.send_message(
@@ -624,15 +772,15 @@ async def sniper_loop():
                     f"• Scan toutes les <b>{SCAN_INTERVAL}s</b>\n"
                     f"• Deal si réduction ≥ <b>{DEAL_THRESHOLD}%</b>\n"
                     f"• Priorité si réduction ≥ <b>{PRIORITY_THRESHOLD}%</b>\n"
-                    f"• Collections: <b>{len(COLLECTIONS)}</b>\n\n"
-                    f"📡 Surveillance active..."
+                    f"• Source: <b>TonAPI (officiel GetGems)</b>\n\n"
+                    f"📡 Découverte des collections en cours..."
                 ),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             log.warning(f"Impossible d'envoyer le message de démarrage: {e}")
 
-    connector = aiohttp.TCPConnector(ssl=False, limit=10)
+    connector = aiohttp.TCPConnector(ssl=False, limit=5)
     scan_count = 0
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -641,37 +789,94 @@ async def sniper_loop():
             scan_count += 1
             deals_found = 0
 
-            shuffled = COLLECTIONS[:]
+            # ── Refresh actualités toutes les heures ─────────────────────
+            await maybe_refresh_news(session)
+
+            # ── Redécouverte des collections toutes les 30 min ──────────────
+            if time.time() - _last_discovery > 1800 or not _discovered_collections:
+                collections = await discover_getgems_collections(session, pages=5)
+                log.info(f"📋 {len(collections)} collections GetGems découvertes via TonAPI")
+            else:
+                collections = _discovered_collections
+
+            if not collections:
+                log.warning("⚠️ Aucune collection trouvée — retry dans 60s")
+                await asyncio.sleep(60)
+                continue
+
+            # ── Scan d'un sous-ensemble de collections (évite rate-limit TonAPI) ─
+            shuffled = collections[:]
             random.shuffle(shuffled)
+            batch = shuffled[:MAX_COLLECTIONS_PER_CYCLE]
+            log.info(f"🔍 Scan #{scan_count}: {len(batch)}/{len(collections)} collections | seuil={DEAL_THRESHOLD}% | clé={'OUI' if TONAPI_KEY else 'NON'}")
 
-            for slug in shuffled:
+            # Compteurs de diagnostic pour ce cycle
+            diag_cols_with_listings = 0
+            diag_items_fetched = 0
+            diag_items_gg = 0
+            diag_items_below_floor = 0
+            diag_items_qualifying = 0
+            diag_errors = 0
+            sample_col = ""
+            sample_prices: list[float] = []
+            sample_floor = 0.0
+
+            for col in batch:
+                col_address = col.get("address", "")
+                col_name    = (col.get("metadata") or {}).get("name", col_address[:20])
+
+                if not col_address:
+                    continue
+
                 try:
-                    floor_data = await fetch_floor(session, slug)
-                    if not floor_data:
-                        continue
+                    listings = await get_collection_listings(session, col_address)
 
-                    col_name, floor_ton, volume_ton, _ = floor_data
+                    diag_items_gg += len(listings)
 
-                    # Filtre anti-fake : ignorer collections mortes
+                    if len(listings) < 2:
+                        if listings:
+                            log.debug(f"  ↳ {col_name}: {len(listings)} listing(s) GetGems — insuffisant (<2)")
+                        continue  # Pas assez de données
+
+                    diag_cols_with_listings += 1
+
+                    # Floor virtuel = médiane des prix en vente
+                    floor_ton  = compute_virtual_floor(listings)
+                    volume_ton = 0.0
+                    trend      = await get_floor_trend(col_address)
+
                     if floor_ton <= 0:
+                        log.debug(f"  ↳ {col_name}: floor=0 (listings vides)")
                         continue
 
-                    listings = await fetch_listings(session, slug)
+                    log.info(f"  ↳ {col_name}: {len(listings)} listings GetGems | floor={floor_ton:.3f} TON")
 
-                    # Tendance du floor (hausse / baisse vs hier)
-                    trend = await get_floor_trend(slug)
+                    # Cache pour les stats du dashboard
+                    await cache_floor(col_address, col_name, floor_ton, volume_ton, len(listings))
 
+                    # Watchlist automatique
+                    await auto_add_to_watchlist(col_address, col_name)
+
+                    # Sauvegarde le premier exemple pour le diagnostic
+                    if not sample_col:
+                        sample_col = col_name
+                        sample_prices = sorted(l["price_ton"] for l in listings)[:10]
+                        sample_floor = floor_ton
+
+                    col_deals = 0
                     for item in listings:
                         price = item["price_ton"]
                         if price <= 0 or price >= floor_ton:
                             continue
 
+                        diag_items_below_floor += 1
                         discount = (floor_ton - price) / floor_ton * 100
                         if discount < DEAL_THRESHOLD:
                             continue
 
+                        diag_items_qualifying += 1
+
                         address = item["address"]
-                        # Anti-spam : déjà alerté ?
                         if await is_already_alerted(address):
                             continue
 
@@ -693,23 +898,54 @@ async def sniper_loop():
 
                         emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
                         log.info(
-                            f"{emoji} {item['name']} "
+                            f"{emoji} DEAL: {item['name']} "
                             f"@ {price:.4f} TON (floor {floor_ton:.4f}) "
-                            f"-{discount:.1f}% | score {score} | trend {trend:+.1f}%"
+                            f"-{discount:.1f}% | score {score}"
                         )
 
                         await send_alert(deal)
-                        await mark_as_alerted(address, item["name"], col_name,
-                                               price, floor_ton, round(discount, 1),
-                                               score=score, priority=priority)
+                        await mark_as_alerted(
+                            address, item["name"], col_name,
+                            price, floor_ton, round(discount, 1),
+                            score=score, priority=priority,
+                        )
                         deals_found += 1
+                        col_deals += 1
+
+                    if diag_items_below_floor > 0 and col_deals == 0:
+                        log.info(f"    → {diag_items_below_floor} items sous floor, 0 qualifié (seuil {DEAL_THRESHOLD}%)")
 
                 except Exception as e:
-                    log.error(f"Erreur scan {slug}: {e}")
+                    log.error(f"Erreur scan {col_name}: {e}", exc_info=True)
+                    diag_errors += 1
+
+            # ── Mise à jour du diagnostic global ─────────────────────────────
+            _scan_diagnostics.update({
+                "cycle": scan_count,
+                "collections_total": len(collections),
+                "collections_scanned": len(batch),
+                "collections_with_listings": diag_cols_with_listings,
+                "items_getgems": diag_items_gg,
+                "items_below_floor": diag_items_below_floor,
+                "items_qualifying": diag_items_qualifying,
+                "deals_found": deals_found,
+                "tonapi_errors": diag_errors,
+                "tonapi_rate_limited": time.time() < _tonapi_rate_limited_until,
+                "last_collection_scanned": sample_col,
+                "last_collection_listings": len(sample_prices),
+                "sample_prices": sample_prices,
+                "sample_floor": sample_floor,
+                "ts": time.time(),
+            })
 
             await increment_scan()
             elapsed = time.time() - t0
-            log.info(f"✅ Scan #{scan_count} en {elapsed:.1f}s | {deals_found} deal(s)")
+            log.info(
+                f"✅ Cycle #{scan_count} terminé en {elapsed:.1f}s | "
+                f"{deals_found} deal(s) | {diag_cols_with_listings}/{len(batch)} cols avec listings | "
+                f"{diag_items_gg} items GetGems | {diag_items_below_floor} sous floor | "
+                f"{diag_items_qualifying} qualifiés"
+            )
 
             sleep_for = max(1.0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_for)
@@ -985,7 +1221,71 @@ async def handle_watchlist_delete(req):
     except Exception as e:
         return json_resp({"error": str(e)}, 500)
 
+# ── GET /api/news ──
+async def handle_news(req):
+    limit = int(req.rel_url.query.get("limit", 20))
+    category = req.rel_url.query.get("category", "")
+    sql = "SELECT id, title, url, summary, source, category, published_at FROM news WHERE 1=1"
+    params: list = []
+    if category:
+        sql += " AND category = ?"
+        params.append(category)
+    sql += " ORDER BY published_at DESC LIMIT ?"
+    params.append(limit)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+    items = [
+        {
+            "id": r[0], "title": r[1], "url": r[2], "summary": r[3],
+            "source": r[4], "category": r[5], "publishedAt": r[6],
+        }
+        for r in rows
+    ]
+    return json_resp(items)
+
+# ── GET /api/featured ──
+async def handle_featured(req):
+    """Collections en vedette : top actives + spotlight curatées."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT slug, name, floor_ton, item_count, updated_at
+            FROM floor_cache
+            WHERE floor_ton > 0
+            ORDER BY item_count DESC, floor_ton DESC
+            LIMIT 10
+        """) as cur:
+            rows = await cur.fetchall()
+    live = [
+        {
+            "slug": r[0],
+            "name": r[1],
+            "floorTon": round(r[2], 4),
+            "listings": r[3],
+            "updatedAt": r[4],
+            "url": f"https://getgems.io/collection/{r[0]}",
+            "type": "live",
+        }
+        for r in rows
+    ]
+    return json_resp({
+        "live": live,
+        "spotlight": SPOTLIGHT_COLLECTIONS,
+    })
+
 # ── GET /api/bot/status ──
+async def handle_debug_scan(req):
+    """Expose les diagnostics du dernier cycle de scan."""
+    global _scan_diagnostics
+    diag = dict(_scan_diagnostics)
+    diag["tonapi_key_set"] = bool(TONAPI_KEY)
+    diag["deal_threshold"] = DEAL_THRESHOLD
+    diag["scan_interval"] = SCAN_INTERVAL
+    diag["max_per_cycle"] = MAX_COLLECTIONS_PER_CYCLE
+    diag["age_seconds"] = round(time.time() - diag["ts"], 1) if diag["ts"] else None
+    diag["rate_limit_remaining_s"] = max(0, round(_tonapi_rate_limited_until - time.time(), 1))
+    return json_resp(diag)
+
 async def handle_bot_status(req):
     s = await get_stats()
     return json_resp({
@@ -998,6 +1298,9 @@ async def handle_bot_status(req):
         "totalScans": s.get("scans", 0),
         "totalAlertsSet": s.get("alerts", 0),
         "lastActivity": s.get("last_scan"),
+        "tonapiKeySet": bool(TONAPI_KEY),
+        "maxCollectionsPerCycle": MAX_COLLECTIONS_PER_CYCLE,
+        "collectionsKnown": len(_discovered_collections),
     })
 
 # ── PUT /api/bot/config ──
@@ -1005,6 +1308,118 @@ async def handle_bot_config(req):
     # La config vit dans les variables d'environnement sur Railway
     # On retourne juste un succès ici (les vraies configs sont dans Railway)
     return json_resp({"ok": True, "message": "Modifiez les variables d'environnement Railway pour changer la config."})
+
+# ── GET /api/trends ──
+async def handle_trends(req):
+    """
+    Retourne les tendances de prix pour toutes les collections suivies.
+    Paramètre: ?period=24h|7d|30d
+    """
+    period = req.rel_url.query.get("period", "7d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Toutes les collections en cache (issues du scanner TonAPI)
+        async with db.execute("""
+            SELECT slug, name, floor_ton, volume_24h, item_count, updated_at
+            FROM floor_cache
+            WHERE floor_ton > 0
+            ORDER BY floor_ton DESC
+        """) as cur:
+            collections = await cur.fetchall()
+
+        result = []
+        for col in collections:
+            slug, name, current_floor, volume, item_count, updated = col
+
+            # Variation 24h
+            async with db.execute("""
+                SELECT AVG(floor_ton) FROM floor_history
+                WHERE slug = ?
+                  AND recorded_at BETWEEN datetime('now', '-26 hours')
+                                      AND datetime('now', '-22 hours')
+            """, (slug,)) as cur:
+                row = await cur.fetchone()
+                floor_24h = row[0] if row and row[0] else None
+
+            # Variation 7j
+            async with db.execute("""
+                SELECT AVG(floor_ton) FROM floor_history
+                WHERE slug = ?
+                  AND recorded_at BETWEEN datetime('now', '-7 days', '-2 hours')
+                                      AND datetime('now', '-7 days', '+2 hours')
+            """, (slug,)) as cur:
+                row = await cur.fetchone()
+                floor_7d = row[0] if row and row[0] else None
+
+            # Historique de prix selon la période
+            if period == "24h":
+                hist_sql = """
+                    SELECT strftime('%Y-%m-%dT%H:00:00', recorded_at), AVG(floor_ton)
+                    FROM floor_history
+                    WHERE slug = ? AND recorded_at >= datetime('now', '-24 hours')
+                    GROUP BY strftime('%Y-%m-%dT%H:00:00', recorded_at)
+                    ORDER BY recorded_at
+                """
+            elif period == "30d":
+                hist_sql = """
+                    SELECT strftime('%Y-%m-%d', recorded_at), AVG(floor_ton)
+                    FROM floor_history
+                    WHERE slug = ? AND recorded_at >= datetime('now', '-30 days')
+                    GROUP BY strftime('%Y-%m-%d', recorded_at)
+                    ORDER BY recorded_at
+                """
+            else:  # 7d par défaut
+                hist_sql = """
+                    SELECT strftime('%Y-%m-%d', recorded_at), AVG(floor_ton)
+                    FROM floor_history
+                    WHERE slug = ? AND recorded_at >= datetime('now', '-7 days')
+                    GROUP BY strftime('%Y-%m-%d', recorded_at)
+                    ORDER BY recorded_at
+                """
+
+            async with db.execute(hist_sql, (slug,)) as cur:
+                history_rows = await cur.fetchall()
+
+            # Calcul des % de variation
+            change_24h = None
+            if current_floor and floor_24h and floor_24h > 0:
+                change_24h = round((current_floor - floor_24h) / floor_24h * 100, 1)
+
+            change_7d = None
+            if current_floor and floor_7d and floor_7d > 0:
+                change_7d = round((current_floor - floor_7d) / floor_7d * 100, 1)
+
+            # Nombre de deals détectés par collection (proxy du volume)
+            async with db.execute("""
+                SELECT COUNT(*) FROM alerted_nfts WHERE collection = ?
+            """, (name,)) as cur:
+                row = await cur.fetchone()
+                deals_count = row[0] if row else 0
+
+            result.append({
+                "slug":         slug,
+                "name":         name or slug[:20],
+                "currentFloor": round(current_floor, 4) if current_floor else 0,
+                "itemCount":    item_count or 0,
+                "volume24h":    round(volume or 0, 2),
+                "dealsFound":   deals_count,
+                "change24h":    change_24h,
+                "change7d":     change_7d,
+                "updatedAt":    updated,
+                "floorHistory": [
+                    {"time": r[0], "floor": round(r[1], 4)}
+                    for r in history_rows if r[1]
+                ],
+            })
+
+    # Trie par activité (variation 24h absolue en premier, puis collections actives)
+    result.sort(key=lambda x: (
+        -abs(x.get("change24h") or 0),
+        -(x.get("itemCount") or 0),
+    ))
+
+    return json_resp({"collections": result, "period": period})
+
 
 # ── OPTIONS (CORS preflight) ──
 async def handle_options(req):
@@ -1043,11 +1458,15 @@ async def start_web_server():
     app.router.add_get("/api/deals/history",         handle_deals_history)
     app.router.add_get("/api/stats/charts",          handle_stats_charts)
     app.router.add_get("/api/collections",           handle_collections)
+    app.router.add_get("/api/trends",                handle_trends)
+    app.router.add_get("/api/news",                  handle_news)
+    app.router.add_get("/api/featured",              handle_featured)
     app.router.add_get("/api/watchlist",             handle_watchlist_get)
     app.router.add_post("/api/watchlist",            handle_watchlist_post)
     app.router.add_delete("/api/watchlist/{id}",     handle_watchlist_delete)
     app.router.add_get("/api/bot/status",            handle_bot_status)
     app.router.add_put("/api/bot/config",            handle_bot_config)
+    app.router.add_get("/api/debug/scan",            handle_debug_scan)
     app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
 
     # ── Fichiers statiques React (SPA routing) ───────────────────────────
@@ -1071,6 +1490,7 @@ async def main():
         bot = Bot(token=TELEGRAM_TOKEN)
 
     await init_db()
+    await seed_initial_news()
 
     # Serveur web : API REST + fichiers statiques Mini App
     await start_web_server()
@@ -1079,6 +1499,13 @@ async def main():
     asyncio.create_task(sniper_loop())
 
     if bot:
+        # Supprime toutes les commandes du menu "/" — tout passe par le dashboard
+        try:
+            await bot.delete_my_commands()
+            log.info("✅ Menu de commandes Telegram effacé")
+        except Exception as e:
+            log.warning(f"Impossible d'effacer les commandes: {e}")
+
         log.info("🤖 Démarrage du polling Telegram (aiogram 3.x)...")
         # start_polling DOIT être awaité directement en aiogram 3.x
         # drop_pending_updates=True évite de traiter les vieux messages
