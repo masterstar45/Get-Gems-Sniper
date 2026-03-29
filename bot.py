@@ -61,6 +61,26 @@ KNOWN_COLLECTION_ADDRESSES: list[str] = [
 _discovered_collections: list[dict] = []
 _last_discovery: float = 0.0
 
+# Diagnostics du dernier cycle de scan (exposé via /api/debug/scan)
+_scan_diagnostics: dict = {
+    "cycle": 0,
+    "collections_total": 0,
+    "collections_scanned": 0,
+    "collections_with_listings": 0,
+    "items_fetched": 0,
+    "items_getgems": 0,
+    "items_below_floor": 0,
+    "items_qualifying": 0,
+    "deals_found": 0,
+    "tonapi_errors": 0,
+    "tonapi_rate_limited": False,
+    "last_collection_scanned": "",
+    "last_collection_listings": 0,
+    "sample_prices": [],
+    "sample_floor": 0.0,
+    "ts": 0.0,
+}
+
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -928,6 +948,7 @@ async def sniper_loop():
             # ── Redécouverte des collections toutes les 30 min ──────────────
             if time.time() - _last_discovery > 1800 or not _discovered_collections:
                 collections = await discover_getgems_collections(session, pages=5)
+                log.info(f"📋 {len(collections)} collections GetGems découvertes via TonAPI")
             else:
                 collections = _discovered_collections
 
@@ -940,7 +961,18 @@ async def sniper_loop():
             shuffled = collections[:]
             random.shuffle(shuffled)
             batch = shuffled[:MAX_COLLECTIONS_PER_CYCLE]
-            log.info(f"🔍 Scan de {len(batch)}/{len(collections)} collections (max {MAX_COLLECTIONS_PER_CYCLE}/cycle)")
+            log.info(f"🔍 Scan #{scan_count}: {len(batch)}/{len(collections)} collections | seuil={DEAL_THRESHOLD}% | clé={'OUI' if TONAPI_KEY else 'NON'}")
+
+            # Compteurs de diagnostic pour ce cycle
+            diag_cols_with_listings = 0
+            diag_items_fetched = 0
+            diag_items_gg = 0
+            diag_items_below_floor = 0
+            diag_items_qualifying = 0
+            diag_errors = 0
+            sample_col = ""
+            sample_prices: list[float] = []
+            sample_floor = 0.0
 
             for col in batch:
                 col_address = col.get("address", "")
@@ -952,31 +984,50 @@ async def sniper_loop():
                 try:
                     listings = await get_collection_listings(session, col_address)
 
+                    diag_items_gg += len(listings)
+
                     if len(listings) < 2:
+                        if listings:
+                            log.debug(f"  ↳ {col_name}: {len(listings)} listing(s) GetGems — insuffisant (<2)")
                         continue  # Pas assez de données
+
+                    diag_cols_with_listings += 1
 
                     # Floor virtuel = médiane des prix en vente
                     floor_ton  = compute_virtual_floor(listings)
-                    volume_ton = 0.0  # TonAPI ne donne pas le volume direct
+                    volume_ton = 0.0
                     trend      = await get_floor_trend(col_address)
 
                     if floor_ton <= 0:
+                        log.debug(f"  ↳ {col_name}: floor=0 (listings vides)")
                         continue
+
+                    log.info(f"  ↳ {col_name}: {len(listings)} listings GetGems | floor={floor_ton:.3f} TON")
 
                     # Cache pour les stats du dashboard
                     await cache_floor(col_address, col_name, floor_ton, volume_ton, len(listings))
 
-                    # Watchlist automatique : toute collection active y est ajoutée
+                    # Watchlist automatique
                     await auto_add_to_watchlist(col_address, col_name)
 
+                    # Sauvegarde le premier exemple pour le diagnostic
+                    if not sample_col:
+                        sample_col = col_name
+                        sample_prices = sorted(l["price_ton"] for l in listings)[:10]
+                        sample_floor = floor_ton
+
+                    col_deals = 0
                     for item in listings:
                         price = item["price_ton"]
                         if price <= 0 or price >= floor_ton:
                             continue
 
+                        diag_items_below_floor += 1
                         discount = (floor_ton - price) / floor_ton * 100
                         if discount < DEAL_THRESHOLD:
                             continue
+
+                        diag_items_qualifying += 1
 
                         address = item["address"]
                         if await is_already_alerted(address):
@@ -1000,8 +1051,8 @@ async def sniper_loop():
 
                         emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
                         log.info(
-                            f"{emoji} {item['name']} "
-                            f"@ {price:.4f} TON (floor médiane {floor_ton:.4f}) "
+                            f"{emoji} DEAL: {item['name']} "
+                            f"@ {price:.4f} TON (floor {floor_ton:.4f}) "
                             f"-{discount:.1f}% | score {score}"
                         )
 
@@ -1012,13 +1063,42 @@ async def sniper_loop():
                             score=score, priority=priority,
                         )
                         deals_found += 1
+                        col_deals += 1
+
+                    if diag_items_below_floor > 0 and col_deals == 0:
+                        log.info(f"    → {diag_items_below_floor} items sous floor, 0 qualifié (seuil {DEAL_THRESHOLD}%)")
 
                 except Exception as e:
-                    log.error(f"Erreur scan {col_name}: {e}")
+                    log.error(f"Erreur scan {col_name}: {e}", exc_info=True)
+                    diag_errors += 1
+
+            # ── Mise à jour du diagnostic global ─────────────────────────────
+            _scan_diagnostics.update({
+                "cycle": scan_count,
+                "collections_total": len(collections),
+                "collections_scanned": len(batch),
+                "collections_with_listings": diag_cols_with_listings,
+                "items_getgems": diag_items_gg,
+                "items_below_floor": diag_items_below_floor,
+                "items_qualifying": diag_items_qualifying,
+                "deals_found": deals_found,
+                "tonapi_errors": diag_errors,
+                "tonapi_rate_limited": time.time() < _tonapi_rate_limited_until,
+                "last_collection_scanned": sample_col,
+                "last_collection_listings": len(sample_prices),
+                "sample_prices": sample_prices,
+                "sample_floor": sample_floor,
+                "ts": time.time(),
+            })
 
             await increment_scan()
             elapsed = time.time() - t0
-            log.info(f"✅ Scan #{scan_count} en {elapsed:.1f}s | {deals_found} deal(s) | {len(collections)} collections")
+            log.info(
+                f"✅ Cycle #{scan_count} terminé en {elapsed:.1f}s | "
+                f"{deals_found} deal(s) | {diag_cols_with_listings}/{len(batch)} cols avec listings | "
+                f"{diag_items_gg} items GetGems | {diag_items_below_floor} sous floor | "
+                f"{diag_items_qualifying} qualifiés"
+            )
 
             sleep_for = max(1.0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_for)
@@ -1347,6 +1427,18 @@ async def handle_featured(req):
     })
 
 # ── GET /api/bot/status ──
+async def handle_debug_scan(req):
+    """Expose les diagnostics du dernier cycle de scan."""
+    global _scan_diagnostics
+    diag = dict(_scan_diagnostics)
+    diag["tonapi_key_set"] = bool(TONAPI_KEY)
+    diag["deal_threshold"] = DEAL_THRESHOLD
+    diag["scan_interval"] = SCAN_INTERVAL
+    diag["max_per_cycle"] = MAX_COLLECTIONS_PER_CYCLE
+    diag["age_seconds"] = round(time.time() - diag["ts"], 1) if diag["ts"] else None
+    diag["rate_limit_remaining_s"] = max(0, round(_tonapi_rate_limited_until - time.time(), 1))
+    return json_resp(diag)
+
 async def handle_bot_status(req):
     s = await get_stats()
     return json_resp({
@@ -1527,6 +1619,7 @@ async def start_web_server():
     app.router.add_delete("/api/watchlist/{id}",     handle_watchlist_delete)
     app.router.add_get("/api/bot/status",            handle_bot_status)
     app.router.add_put("/api/bot/config",            handle_bot_config)
+    app.router.add_get("/api/debug/scan",            handle_debug_scan)
     app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
 
     # ── Fichiers statiques React (SPA routing) ───────────────────────────
