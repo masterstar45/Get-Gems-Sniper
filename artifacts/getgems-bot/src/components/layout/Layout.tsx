@@ -6,6 +6,7 @@ import { haptic } from "@/hooks/useTelegram";
 import { useGetBotStatus } from "@workspace/api-client-react";
 import { useTonWallet } from "@/hooks/useTonWallet";
 import { useDealsNotifier } from "@/hooks/useDealsNotifier";
+import { useSafeArea } from "@/hooks/useSafeArea";
 import { useState, useEffect } from "react";
 
 const TABS = [
@@ -71,20 +72,34 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const [location] = useLocation();
   const { data: botStatus } = useGetBotStatus({ query: { refetchInterval: 8000 } });
   const { newCount, markAllSeen } = useDealsNotifier();
+  const safeArea = useSafeArea();
 
   const isActive = (href: string) =>
     href === "/" ? location === "/" : location.startsWith(href);
 
-  // Quand l'utilisateur ouvre l'onglet Deals, marque tout comme vu
   useEffect(() => {
     if (location === "/") markAllSeen();
   }, [location, markAllSeen]);
 
+  // Hauteur de la tabbar + safe area bottom
+  const tabbarHeight = 56; // px — hauteur fixe des onglets
+  const safeBottom   = safeArea.bottom;
+  const safeTop      = safeArea.top;
+
   return (
-    <div className="tg-app flex flex-col h-screen overflow-hidden">
+    <div
+      className="tg-app flex flex-col overflow-hidden"
+      style={{ height: "100dvh" }}
+    >
 
       {/* ── Header compact ── */}
-      <header className="tg-header flex items-center justify-between px-4 py-2.5 flex-shrink-0">
+      <header
+        className="tg-header flex items-center justify-between px-4 flex-shrink-0"
+        style={{
+          paddingTop:    `calc(0.625rem + ${safeTop}px)`,
+          paddingBottom: "0.625rem",
+        }}
+      >
         <div className="flex items-center gap-2.5">
           <div className="relative w-8 h-8">
             <div className="w-8 h-8 rounded-xl bg-button flex items-center justify-center text-button-text text-base font-bold select-none">
@@ -103,7 +118,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
             </p>
           </div>
         </div>
-
         <WalletButton />
       </header>
 
@@ -116,28 +130,36 @@ export function Layout({ children }: { children: React.ReactNode }) {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.18, ease: "easeOut" }}
-            className="px-3 py-3"
-            style={{ paddingBottom: 'calc(6rem + env(safe-area-inset-bottom, 0px))' }}
+            className="px-3 pt-3"
+            style={{
+              paddingBottom: `${tabbarHeight + safeBottom + 16}px`,
+            }}
           >
             {children}
           </motion.div>
         </AnimatePresence>
       </main>
 
-      {/* ── Navigation bas (scrollable) ── */}
-      <nav className="tg-tabbar fixed bottom-0 left-0 right-0 border-t z-50 overflow-x-auto"
-        style={{ borderColor: "rgba(255,255,255,0.06)" }}>
-        <div className="flex items-stretch" style={{ minWidth: "max-content", width: "100%" }}>
+      {/* ── Navigation bas (scrollable horizontalement) ── */}
+      <nav
+        className="tg-tabbar flex-shrink-0 border-t overflow-x-auto"
+        style={{
+          borderColor:   "rgba(255,255,255,0.06)",
+          paddingBottom: `${safeBottom}px`,
+          height:        `${tabbarHeight + safeBottom}px`,
+        }}
+      >
+        <div className="flex items-stretch h-full" style={{ minWidth: "max-content", width: "100%" }}>
           {TABS.map((tab) => {
-            const active = isActive(tab.href);
-            const showBadge = tab.href === "/" && newCount > 0 && !active;
+            const active     = isActive(tab.href);
+            const showBadge  = tab.href === "/" && newCount > 0 && !active;
             return (
               <Link
                 key={tab.href}
                 href={tab.href}
                 onClick={() => { haptic.select(); if (tab.href === "/") markAllSeen(); }}
                 className={cn(
-                  "relative flex flex-col items-center justify-center gap-0.5 py-2 transition-colors duration-150 select-none",
+                  "relative flex flex-col items-center justify-center gap-0.5 py-1 transition-colors duration-150 select-none",
                   active ? "text-button" : "text-hint"
                 )}
                 style={{ minWidth: "52px", flex: "1 1 0" }}
@@ -153,7 +175,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                     </span>
                   )}
                 </div>
-                <span className="text-[8px] font-semibold">{tab.label}</span>
+                <span className="text-[8px] font-semibold leading-none">{tab.label}</span>
                 {active && (
                   <motion.div
                     layoutId="tab-indicator"
