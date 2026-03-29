@@ -198,6 +198,12 @@ async def init_db():
                 published_at TEXT,
                 fetched_at   TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS runtime_config (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
         """)
         # Migrations sans-casse (colonnes ajoutées si absentes)
         for col_def in [
@@ -514,6 +520,46 @@ def compute_virtual_floor(listings: list[dict]) -> float:
         return (prices[n // 2 - 1] + prices[n // 2]) / 2
     return prices[n // 2]
 
+# ─── RUNTIME CONFIG (persistée en DB, modifiable depuis le dashboard) ────────
+
+import json as _json_cfg
+
+_runtime_config: dict = {
+    "scan_types":      ["getgems", "tg_gifts", "fragment"],
+    "max_price_ton":   0.0,    # 0 = pas de limite
+    "top_gifts_count": 20,     # top N collections Gift à scanner en priorité
+}
+
+async def load_runtime_config() -> dict:
+    """Charge la config depuis runtime_config DB → met à jour _runtime_config."""
+    global _runtime_config
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT key, value FROM runtime_config") as cur:
+                rows = await cur.fetchall()
+        for k, v in rows:
+            if k == "scan_types":
+                _runtime_config["scan_types"] = _json_cfg.loads(v)
+            elif k == "max_price_ton":
+                _runtime_config["max_price_ton"] = float(v)
+            elif k == "top_gifts_count":
+                _runtime_config["top_gifts_count"] = int(v)
+    except Exception as e:
+        log.debug(f"load_runtime_config: {e}")
+    return dict(_runtime_config)
+
+async def save_runtime_config_key(key: str, value) -> None:
+    """Sauvegarde une clé dans runtime_config DB."""
+    str_val = _json_cfg.dumps(value) if isinstance(value, list) else str(value)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+            (key, str_val)
+        )
+        await db.commit()
+    _runtime_config[key] = value
+
+
 # ─── GETGEMS GRAPHQL CLIENT ──────────────────────────────────────────────────
 
 GG_GRAPHQL_URL = "https://api.getgems.io/graphql"
@@ -554,7 +600,7 @@ async def gg_query(session: aiohttp.ClientSession, query: str, variables: dict |
 # Requête GraphQL : toutes les collections de type tgGift avec leur floor
 _GG_GIFTS_COLLECTIONS_QUERY = """
 {
-  alphaNftCollections(first: 100, sort: TradeVolume, types: [tgGift]) {
+  alphaNftCollections(first: 200, sort: TradeVolume, types: [tgGift]) {
     items {
       ... on NftCollection {
         address
@@ -562,6 +608,7 @@ _GG_GIFTS_COLLECTIONS_QUERY = """
         floorPrice { value }
         counters { activeAuctions }
         totalSales
+        itemsCount
       }
     }
     pageInfo { hasNextPage endCursor }
@@ -618,10 +665,12 @@ async def discover_gift_collections(session: aiohttp.ClientSession) -> list[dict
         floor_ton = int(floor_val) / 1e9 if floor_val else 0.0
         if addr and active > 0:
             result.append({
-                "address":    addr,
-                "name":       name,
-                "floor_ton":  floor_ton,
-                "total_sales": item.get("totalSales", 0),
+                "address":     addr,
+                "name":        name,
+                "floor_ton":   floor_ton,
+                "total_sales": item.get("totalSales", 0) or 0,
+                "items_count": item.get("itemsCount", 0) or 0,
+                "active_auctions": active,
             })
 
     _gift_collections_cache = result
@@ -754,11 +803,12 @@ _fragment_slug_idx: int = 0  # rotation circulaire
 _last_fragment_scan: float = 0.0
 
 
-async def scan_fragment_gifts(session: aiohttp.ClientSession) -> int:
+async def scan_fragment_gifts(session: aiohttp.ClientSession, max_price_ton: float = 0.0) -> int:
     """
     Scan partiel de Fragment.com pour les Telegram Gifts.
     Tente d'extraire les prix via le JSON Next.js intégré dans le HTML.
     Retourne le nombre de deals trouvés.
+    max_price_ton : si > 0, ignore les items dont le prix dépasse ce seuil.
     """
     global _fragment_slug_idx, _fragment_floor_cache
 
@@ -853,6 +903,11 @@ async def scan_fragment_gifts(session: aiohttp.ClientSession) -> int:
                 await asyncio.sleep(1.5)
                 continue
 
+            # Filtre prix max (si configuré)
+            if max_price_ton > 0 and min_price > max_price_ton:
+                await asyncio.sleep(1.5)
+                continue
+
             discount = (floor_ton - min_price) / floor_ton * 100
             if discount < DEAL_THRESHOLD:
                 await asyncio.sleep(1.5)
@@ -883,6 +938,100 @@ async def scan_fragment_gifts(session: aiohttp.ClientSession) -> int:
 
         except Exception as e:
             log.debug(f"Fragment scan {slug}: {e}")
+
+    return deals_found
+
+
+# ─── SCAN TOP GIFTS : top N collections par volume ──────────────────────────
+
+async def scan_top_gifts(
+    session: aiohttp.ClientSession,
+    top_n: int = 20,
+    max_price_ton: float = 0.0,
+) -> int:
+    """
+    Scan approfondi des top_n collections Telegram Gift les plus actives sur GetGems.
+    Trie les collections par volume_7d décroissant (ou item_count si volume absent).
+    Récupère jusqu'à 50 listings par collection et détecte les deals.
+    Retourne le nombre de deals trouvés.
+    """
+    # 1. Découverte de toutes les collections Gift
+    all_cols = await discover_gift_collections(session)
+    if not all_cols:
+        return 0
+
+    # 2. Trie par total_sales décroissant (= volume d'échanges historique)
+    #    puis par active_auctions comme tie-breaker
+    def _sort_key(c):
+        sales   = c.get("total_sales", 0) or 0
+        active  = c.get("active_auctions", 0) or 0
+        return (sales, active)
+
+    sorted_cols = sorted(all_cols, key=_sort_key, reverse=True)
+    top_cols = sorted_cols[:top_n]
+
+    log.info(f"🏆 Top Gifts scan: {len(top_cols)} collections sélectionnées sur {len(all_cols)}")
+
+    deals_found = 0
+    for col in top_cols:
+        col_addr  = col["address"]
+        col_name  = col["name"]
+        floor_gql = col.get("floor_ton", 0.0)
+
+        try:
+            # Récupère jusqu'à 100×5 ventes (pagination complète via get_gift_sales_gg)
+            listings = await get_gift_sales_gg(session, col_addr)
+            if len(listings) < 2:
+                continue
+
+            floor_ton = floor_gql if floor_gql > 0 else compute_virtual_floor(listings)
+            if floor_ton <= 0:
+                continue
+
+            await cache_floor(col_addr, col_name, floor_ton, 0.0, len(listings))
+            await auto_add_to_watchlist(col_addr, col_name)
+            trend = await get_floor_trend(col_addr)
+
+            log.info(f"  🏆 [TopGift] {col_name}: {len(listings)} ventes | floor={floor_ton:.4f} TON")
+
+            for item in listings:
+                price = item["price_ton"]
+                if price <= 0 or price >= floor_ton:
+                    continue
+                # Filtre prix max
+                if max_price_ton > 0 and price > max_price_ton:
+                    continue
+
+                discount = (floor_ton - price) / floor_ton * 100
+                if discount < DEAL_THRESHOLD:
+                    continue
+
+                address = item["address"]
+                if await is_already_alerted(address):
+                    continue
+
+                score    = compute_score(discount, floor_ton, 0.0, trend)
+                priority = compute_priority(discount)
+
+                emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
+                log.info(
+                    f"    {emoji} [TopGift] {item['name']} @ {price:.4f} TON "
+                    f"(floor {floor_ton:.4f}) -{discount:.1f}% | score {score}"
+                )
+
+                buy_link = item.get("link", f"https://getgems.io/nft/{address}")
+                await mark_as_alerted(
+                    address, item["name"], col_name,
+                    price, floor_ton, round(discount, 1),
+                    score=score, priority=priority,
+                    image_url=item.get("image_url", ""),
+                    source="tg_gifts",
+                    buy_link=buy_link,
+                )
+                deals_found += 1
+
+        except Exception as e:
+            log.debug(f"TopGifts scan {col_name}: {e}")
 
     return deals_found
 
@@ -1244,20 +1393,46 @@ async def sniper_loop():
             scan_count += 1
             deals_found = 0
 
+            # ── Charge la config runtime (peut changer entre deux cycles) ────
+            await load_runtime_config()
+            scan_types  = _runtime_config.get("scan_types", ["getgems", "tg_gifts", "fragment"])
+            max_price   = float(_runtime_config.get("max_price_ton", 0.0))
+
             # ── Refresh actualités toutes les heures ─────────────────────
             await maybe_refresh_news(session)
 
-            # ── Scan Telegram Gift NFTs via GetGems GraphQL ──────────────────
-            gift_deals = await scan_telegram_gifts(session)
-            if gift_deals:
-                log.info(f"🎁 {gift_deals} deal(s) Telegram Gift trouvé(s)")
-                deals_found += gift_deals
+            # ── Scan Top Telegram Gift NFTs (top N collections par volume) ───
+            if "tg_gifts" in scan_types:
+                top_n = int(_runtime_config.get("top_gifts_count", 20))
+                gift_deals = await scan_top_gifts(session, top_n=top_n, max_price_ton=max_price)
+                if gift_deals:
+                    log.info(f"🎁 {gift_deals} deal(s) Telegram Gift (Top {top_n}) trouvé(s)")
+                    deals_found += gift_deals
 
             # ── Scan Fragment.com (best effort) ──────────────────────────────
-            frag_deals = await scan_fragment_gifts(session)
-            if frag_deals:
-                log.info(f"💎 Fragment: {frag_deals} deal(s) trouvé(s)")
-                deals_found += frag_deals
+            if "fragment" in scan_types:
+                frag_deals = await scan_fragment_gifts(session, max_price_ton=max_price)
+                if frag_deals:
+                    log.info(f"💎 Fragment: {frag_deals} deal(s) trouvé(s)")
+                    deals_found += frag_deals
+
+            # ── Scan GetGems via TonAPI (activé si "getgems" dans scan_types) ──
+            if "getgems" not in scan_types:
+                # Mise à jour quand même du diag pour ne pas bloquer l'affichage
+                _scan_diagnostics.update({
+                    "cycle": scan_count, "collections_total": 0,
+                    "collections_scanned": 0, "collections_with_listings": 0,
+                    "items_getgems": 0, "items_below_floor": 0,
+                    "items_qualifying": 0, "deals_found": deals_found,
+                    "tonapi_errors": 0, "tonapi_rate_limited": False,
+                    "last_collection_scanned": "", "last_collection_listings": 0,
+                    "sample_prices": [], "sample_floor": 0.0, "ts": time.time(),
+                })
+                await increment_scan()
+                elapsed = time.time() - t0
+                sleep_for = max(1.0, SCAN_INTERVAL - elapsed)
+                await asyncio.sleep(sleep_for)
+                continue
 
             # ── Redécouverte des collections toutes les 30 min ──────────────
             if time.time() - _last_discovery > 1800 or not _discovered_collections:
@@ -1275,7 +1450,7 @@ async def sniper_loop():
             shuffled = collections[:]
             random.shuffle(shuffled)
             batch = shuffled[:MAX_COLLECTIONS_PER_CYCLE]
-            log.info(f"🔍 Scan #{scan_count}: {len(batch)}/{len(collections)} collections | seuil={DEAL_THRESHOLD}% | clé={'OUI' if TONAPI_KEY else 'NON'}")
+            log.info(f"🔍 Scan #{scan_count}: {len(batch)}/{len(collections)} collections | seuil={DEAL_THRESHOLD}% | max_prix={'∞' if max_price == 0 else f'{max_price:.0f} TON'} | clé={'OUI' if TONAPI_KEY else 'NON'}")
 
             # Compteurs de diagnostic pour ce cycle
             diag_cols_with_listings = 0
@@ -1334,6 +1509,9 @@ async def sniper_loop():
                     for item in listings:
                         price = item["price_ton"]
                         if price <= 0 or price >= floor_ton:
+                            continue
+                        # Filtre prix max (si configuré dans les settings)
+                        if max_price > 0 and price > max_price:
                             continue
 
                         diag_items_below_floor += 1
@@ -1786,9 +1964,53 @@ async def handle_bot_status(req):
 
 # ── PUT /api/bot/config ──
 async def handle_bot_config(req):
-    # La config vit dans les variables d'environnement sur Railway
-    # On retourne juste un succès ici (les vraies configs sont dans Railway)
     return json_resp({"ok": True, "message": "Modifiez les variables d'environnement Railway pour changer la config."})
+
+# ── GET /api/scan/config ──
+async def handle_scan_config_get(req):
+    """Retourne la config runtime du scan (types + prix max)."""
+    cfg = await load_runtime_config()
+    return json_resp({
+        "scanTypes":     cfg.get("scan_types", ["getgems", "tg_gifts", "fragment"]),
+        "maxPriceTon":   cfg.get("max_price_ton", 0.0),
+        "topGiftsCount": cfg.get("top_gifts_count", 20),
+    })
+
+# ── PUT /api/scan/config ──
+async def handle_scan_config_put(req):
+    """Met à jour la config runtime du scan."""
+    try:
+        body = await req.json()
+    except Exception:
+        return json_resp({"error": "JSON invalide"}, status=400)
+
+    updated = {}
+
+    if "scanTypes" in body:
+        valid  = {"getgems", "tg_gifts", "fragment"}
+        types  = [t for t in (body["scanTypes"] or []) if t in valid]
+        if not types:
+            types = list(valid)  # au moins un type activé
+        await save_runtime_config_key("scan_types", types)
+        updated["scanTypes"] = types
+
+    if "maxPriceTon" in body:
+        try:
+            max_p = max(0.0, float(body["maxPriceTon"]))
+        except (TypeError, ValueError):
+            max_p = 0.0
+        await save_runtime_config_key("max_price_ton", max_p)
+        updated["maxPriceTon"] = max_p
+
+    if "topGiftsCount" in body:
+        try:
+            cnt = max(5, min(100, int(body["topGiftsCount"])))
+        except (TypeError, ValueError):
+            cnt = 20
+        await save_runtime_config_key("top_gifts_count", cnt)
+        updated["topGiftsCount"] = cnt
+
+    return json_resp({"ok": True, **updated})
 
 # ── GET /api/trends ──
 async def handle_trends(req):
@@ -1948,6 +2170,8 @@ async def start_web_server():
     app.router.add_get("/api/bot/status",            handle_bot_status)
     app.router.add_put("/api/bot/config",            handle_bot_config)
     app.router.add_get("/api/debug/scan",            handle_debug_scan)
+    app.router.add_get("/api/scan/config",           handle_scan_config_get)
+    app.router.add_put("/api/scan/config",           handle_scan_config_put)
     app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
 
     # ── Fichiers statiques React (SPA routing) ───────────────────────────
