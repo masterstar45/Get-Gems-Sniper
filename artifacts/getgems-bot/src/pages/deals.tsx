@@ -549,16 +549,17 @@ export default function DealsPage() {
           {/* Mode Snipe toggle */}
           <button
             onClick={() => { haptic.select(); setSnipeMode(!snipeMode); }}
-            className="flex items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold transition-all"
+            className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-bold transition-all whitespace-nowrap"
             style={{
               background: snipeMode ? "rgba(255,69,58,0.2)" : "var(--tg-theme-secondary-bg-color)",
               color: snipeMode ? TG_RED : TG_HINT,
               border: snipeMode ? `1px solid ${TG_RED}66` : "1px solid transparent",
             }}
-            title="Mode Snipe : alerte haptique sur les deals extrêmes"
+            title="Mode Snipe : vibration + flash rouge sur les deals extrêmes"
           >
-            <Crosshair className="w-3.5 h-3.5" />
-            {snipeMode && <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: TG_RED }} />}
+            <Crosshair className="w-3.5 h-3.5 flex-shrink-0" />
+            <span>Snipe 🎯</span>
+            {snipeMode && <span className="w-1.5 h-1.5 rounded-full animate-pulse flex-shrink-0" style={{ background: TG_RED }} />}
           </button>
 
           <button
