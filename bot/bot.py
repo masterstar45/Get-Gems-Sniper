@@ -40,22 +40,20 @@ MINI_APP_URL       = os.getenv("MINI_APP_URL", "")
 # Timestamp de démarrage (pour uptime)
 _BOT_START_TIME = time.time()
 
-# API GraphQL GetGems (endpoint officiel, sans clé)
-GETGEMS_GQL = "https://api.getgems.io/graphql"
+# TonAPI — source officielle recommandée par GetGems pour l'accès programmatique
+TONAPI_BASE = "https://tonapi.io/v2"
 
-# Collections de Gifts/NFTs à surveiller
-COLLECTIONS = [
-    "ton-gifts",
-    "telegram-gifts",
-    "getgems-gifts",
-    "the-open-league",
-    "ton-whales",
-    "ton-punks",
-    "mega-ton-whale",
-    "animals-nft",
-    "toncoin-gifts",
-    "getgems-nft",
+# Adresses de collections GetGems connues (seed manuel, complétées automatiquement)
+# Format: adresses TON 0:xxx ou EQxxx
+KNOWN_COLLECTION_ADDRESSES: list[str] = [
+    addr.strip()
+    for addr in os.getenv("EXTRA_COLLECTIONS", "").split(",")
+    if addr.strip()
 ]
+
+# Cache des collections découvertes dynamiquement (mis à jour toutes les 30 min)
+_discovered_collections: list[dict] = []
+_last_discovery: float = 0.0
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -257,128 +255,138 @@ async def get_recent_alerts(limit: int = 5) -> list[dict]:
                 for r in rows
             ]
 
-# ─── GRAPHQL CLIENT ───────────────────────────────────────────────────────────
+# ─── TONAPI CLIENT (source officielle recommandée par GetGems) ────────────────
 
-def gql_headers() -> dict:
-    return {
-        "User-Agent": get_ua(),
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": "https://getgems.io",
-        "Referer": "https://getgems.io/",
-    }
-
-async def gql_request(session: aiohttp.ClientSession, query: str, variables: dict = {}) -> dict | None:
-    """POST GraphQL avec retry et délai aléatoire anti-ban."""
+async def tonapi_get(session: aiohttp.ClientSession, path: str) -> dict | None:
+    """GET vers TonAPI avec retry."""
+    url = f"{TONAPI_BASE}{path}"
     for attempt in range(3):
         try:
-            await asyncio.sleep(random.uniform(0.3, 1.5))
-            async with session.post(
-                GETGEMS_GQL,
-                json={"query": query, "variables": variables},
-                headers=gql_headers(),
-                timeout=aiohttp.ClientTimeout(total=12),
-                ssl=False,
+            await asyncio.sleep(random.uniform(0.2, 0.8))
+            async with session.get(
+                url,
+                headers={"Accept": "application/json", "User-Agent": get_ua()},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 429:
-                    log.warning("⏳ Rate limited — pause 15s")
-                    await asyncio.sleep(15)
+                    log.warning("⏳ TonAPI rate limit — pause 20s")
+                    await asyncio.sleep(20)
                     continue
                 if resp.status != 200:
-                    log.debug(f"GQL HTTP {resp.status}")
-                    continue
-                data = await resp.json()
-                return data.get("data")
+                    log.debug(f"TonAPI {path} → HTTP {resp.status}")
+                    return None
+                return await resp.json()
         except asyncio.TimeoutError:
-            log.debug(f"Timeout (essai {attempt + 1})")
+            log.debug(f"TonAPI timeout (essai {attempt + 1}): {path}")
             await asyncio.sleep(2 ** attempt)
         except Exception as e:
-            log.debug(f"Erreur réseau: {e} (essai {attempt + 1})")
+            log.debug(f"TonAPI erreur: {e} (essai {attempt + 1})")
             await asyncio.sleep(2 ** attempt)
     return None
 
-# ─── REQUÊTES GETGEMS ─────────────────────────────────────────────────────────
+# ─── DÉCOUVERTE DES COLLECTIONS GETGEMS VIA TONAPI ───────────────────────────
 
-QUERY_FLOOR = """
-query CollectionFloor($slug: String!) {
-    alphaNftCollection(slug: $slug) {
-        name
-        approximateCount
-        floorPrice
-        volume24h
-    }
-}
-"""
+async def discover_getgems_collections(session: aiohttp.ClientSession, pages: int = 5) -> list[dict]:
+    """
+    Parcourt TonAPI pour trouver toutes les collections GetGems.
+    Filtre sur metadata.marketplace == 'getgems.io'.
+    """
+    global _discovered_collections, _last_discovery
+    found: list[dict] = []
 
-QUERY_LISTINGS = """
-query CollectionListings($slug: String!, $first: Int!) {
-    alphaNftItems(
-        collectionSlug: $slug
-        first: $first
-        filter: { saleStatus: forSale }
-        sort: { price: asc }
-    ) {
-        edges {
-            node {
-                address
-                name
-                previews { url }
-                sale {
-                    ... on NftSaleFixPrice {
-                        fullPrice
-                    }
-                }
-            }
-        }
-    }
-}
-"""
+    for page in range(pages):
+        offset = page * 200
+        data = await tonapi_get(session, f"/nfts/collections?limit=200&offset={offset}")
+        if not data:
+            break
+        batch = data.get("nft_collections", [])
+        if not batch:
+            break
 
-async def fetch_floor(session: aiohttp.ClientSession, slug: str) -> tuple[str, float, float, int] | None:
-    """Retourne (name, floor_ton, volume_ton, item_count) ou None."""
-    cached = await get_cached_floor(slug)
-    if cached is not None:
-        return (slug, cached, 0.0, 0)
+        for col in batch:
+            marketplace = (col.get("metadata") or {}).get("marketplace", "")
+            if "getgems" in marketplace.lower():
+                found.append(col)
 
-    data = await gql_request(session, QUERY_FLOOR, {"slug": slug})
-    if not data or not data.get("alphaNftCollection"):
-        return None
+        if len(batch) < 200:
+            break  # Dernière page
 
-    col = data["alphaNftCollection"]
-    floor_ton  = int(col.get("floorPrice") or 0) / 1e9
-    volume_ton = int(col.get("volume24h")  or 0) / 1e9
-    count      = col.get("approximateCount", 0)
-    name       = col.get("name", slug)
+    # Ajoute aussi les collections connues (env EXTRA_COLLECTIONS)
+    for addr in KNOWN_COLLECTION_ADDRESSES:
+        if not any(c.get("address") == addr for c in found):
+            found.append({"address": addr, "metadata": {"name": addr[:16]}})
 
-    if floor_ton <= 0:
-        return None
+    _discovered_collections = found
+    _last_discovery = time.time()
+    log.info(f"📦 {len(found)} collections GetGems découvertes via TonAPI")
+    return found
 
-    await cache_floor(slug, name, floor_ton, volume_ton, count)
-    return (name, floor_ton, volume_ton, count)
+async def get_collection_listings(session: aiohttp.ClientSession, col_address: str) -> list[dict]:
+    """
+    Récupère tous les NFTs en vente sur GetGems pour une collection donnée.
+    Utilise la pagination TonAPI. Filtre sur sale.market.name contenant 'getgems'.
+    """
+    listings: list[dict] = []
+    offset = 0
+    limit  = 200
 
-async def fetch_listings(session: aiohttp.ClientSession, slug: str, limit: int = 30) -> list[dict]:
-    """Retourne la liste des NFTs en vente triés par prix croissant."""
-    data = await gql_request(session, QUERY_LISTINGS, {"slug": slug, "first": limit})
-    if not data or "alphaNftItems" not in data:
-        return []
+    while True:
+        data = await tonapi_get(
+            session, f"/nfts/collections/{col_address}/items?limit={limit}&offset={offset}"
+        )
+        if not data:
+            break
 
-    items = []
-    for edge in data["alphaNftItems"].get("edges", []):
-        node  = edge.get("node", {})
-        sale  = node.get("sale", {})
-        price = int(sale.get("fullPrice", 0) or 0)
-        if price == 0:
-            continue
-        previews  = node.get("previews", [])
-        image_url = previews[-1]["url"] if previews else ""
-        items.append({
-            "address":   node.get("address", ""),
-            "name":      node.get("name", "NFT"),
-            "price_ton": price / 1e9,
-            "image_url": image_url,
-            "link":      f"https://getgems.io/nft/{node.get('address', '')}",
-        })
-    return items
+        items = data.get("nft_items", [])
+        if not items:
+            break
+
+        for item in items:
+            sale = item.get("sale")
+            if not sale:
+                continue
+
+            # Filtre GetGems uniquement
+            market_name = (sale.get("market") or {}).get("name", "")
+            if "getgems" not in market_name.lower():
+                continue
+
+            price_nano = int((sale.get("price") or {}).get("value", 0) or 0)
+            if price_nano <= 0:
+                continue
+
+            price_ton = price_nano / 1e9
+            previews  = item.get("previews") or []
+            image_url = previews[-1]["url"] if previews else ""
+
+            listings.append({
+                "address":   item.get("address", ""),
+                "name":      (item.get("metadata") or {}).get("name", "NFT"),
+                "price_ton": price_ton,
+                "image_url": image_url,
+                "link":      f"https://getgems.io/nft/{item.get('address', '')}",
+            })
+
+        if len(items) < limit:
+            break
+        offset += limit
+
+    return listings
+
+def compute_virtual_floor(listings: list[dict]) -> float:
+    """
+    Calcule un floor price 'réel' à partir des listings d'une collection.
+    Stratégie: médiane des prix → évite les outliers bas isolés.
+    Un item est un deal s'il est X% sous la médiane.
+    """
+    if not listings:
+        return 0.0
+    prices = sorted(l["price_ton"] for l in listings)
+    n = len(prices)
+    # Médiane
+    if n % 2 == 0:
+        return (prices[n // 2 - 1] + prices[n // 2]) / 2
+    return prices[n // 2]
 
 # ─── SCORING v2 (0–100) ──────────────────────────────────────────────────────
 
@@ -514,10 +522,14 @@ async def cmd_deals(message: types.Message):
 
 @dp.message(Command("watchlist"))
 async def cmd_watchlist(message: types.Message):
-    text = "📋 <b>Collections surveillées:</b>\n\n"
-    for slug in COLLECTIONS:
-        text += f"• <code>{slug}</code>\n"
-    text += f"\n<i>Seuil deal: -{DEAL_THRESHOLD}% | Priorité: -{PRIORITY_THRESHOLD}%</i>"
+    cols = _discovered_collections or []
+    text = f"📋 <b>{len(cols)} collections GetGems surveillées</b>\n\n"
+    for col in cols[:10]:
+        col_name = (col.get("metadata") or {}).get("name", "?")
+        text += f"• {col_name}\n"
+    if len(cols) > 10:
+        text += f"<i>… et {len(cols) - 10} autres</i>\n"
+    text += f"\n<i>Seuil deal: -{DEAL_THRESHOLD}% | Priorité: -{PRIORITY_THRESHOLD}%\nSource: TonAPI</i>"
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(Command("stats"))
@@ -535,24 +547,31 @@ async def cmd_stats(message: types.Message):
 async def cmd_floor(message: types.Message):
     parts = (message.text or "").split()
     if len(parts) < 2:
-        await message.answer("Usage: /floor &lt;collection-slug&gt;", parse_mode=ParseMode.HTML)
+        await message.answer(
+            "Usage: /floor &lt;adresse-collection&gt;\nEx: /floor 0:3202...f23",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    slug = parts[1].strip()
-    await message.answer(f"🔍 Recherche du floor pour <code>{slug}</code>...", parse_mode=ParseMode.HTML)
+    addr = parts[1].strip()
+    await message.answer(f"🔍 Analyse de <code>{addr[:20]}...</code> via TonAPI...", parse_mode=ParseMode.HTML)
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        result = await fetch_floor(session, slug)
-        if result:
-            name, floor, volume, count = result
+        listings = await get_collection_listings(session, addr)
+        if listings:
+            floor = compute_virtual_floor(listings)
             await message.answer(
-                f"📊 <b>{name}</b>\n"
-                f"Floor: <b>{floor:.4f} TON</b>\n"
-                f"Volume 24h: {volume:.2f} TON\n"
-                f"Items: {count}",
+                f"📊 <b>Floor virtuel (médiane)</b>\n"
+                f"• Floor: <b>{floor:.4f} TON</b>\n"
+                f"• Listings GetGems: {len(listings)}\n"
+                f"• Min: {min(l['price_ton'] for l in listings):.4f} TON\n"
+                f"• Max: {max(l['price_ton'] for l in listings):.4f} TON",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await message.answer(f"❌ Collection <code>{slug}</code> introuvable.", parse_mode=ParseMode.HTML)
+            await message.answer(
+                f"❌ Aucun listing GetGems trouvé pour <code>{addr}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
 
 async def send_alert(deal: dict):
     if not bot or not TELEGRAM_CHAT_ID:
@@ -613,7 +632,7 @@ async def send_alert(deal: dict):
 # ─── BOUCLE DE SNIPING ────────────────────────────────────────────────────────
 
 async def sniper_loop():
-    log.info("🚀 Boucle de sniping démarrée")
+    log.info("🚀 Boucle de sniping démarrée (via TonAPI)")
     if bot and TELEGRAM_CHAT_ID:
         try:
             await bot.send_message(
@@ -624,15 +643,15 @@ async def sniper_loop():
                     f"• Scan toutes les <b>{SCAN_INTERVAL}s</b>\n"
                     f"• Deal si réduction ≥ <b>{DEAL_THRESHOLD}%</b>\n"
                     f"• Priorité si réduction ≥ <b>{PRIORITY_THRESHOLD}%</b>\n"
-                    f"• Collections: <b>{len(COLLECTIONS)}</b>\n\n"
-                    f"📡 Surveillance active..."
+                    f"• Source: <b>TonAPI (officiel GetGems)</b>\n\n"
+                    f"📡 Découverte des collections en cours..."
                 ),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             log.warning(f"Impossible d'envoyer le message de démarrage: {e}")
 
-    connector = aiohttp.TCPConnector(ssl=False, limit=10)
+    connector = aiohttp.TCPConnector(ssl=False, limit=5)
     scan_count = 0
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -641,25 +660,44 @@ async def sniper_loop():
             scan_count += 1
             deals_found = 0
 
-            shuffled = COLLECTIONS[:]
+            # ── Redécouverte des collections toutes les 30 min ──────────────
+            if time.time() - _last_discovery > 1800 or not _discovered_collections:
+                collections = await discover_getgems_collections(session, pages=5)
+            else:
+                collections = _discovered_collections
+
+            if not collections:
+                log.warning("⚠️ Aucune collection trouvée — retry dans 60s")
+                await asyncio.sleep(60)
+                continue
+
+            # ── Scan de chaque collection ────────────────────────────────────
+            shuffled = collections[:]
             random.shuffle(shuffled)
 
-            for slug in shuffled:
+            for col in shuffled:
+                col_address = col.get("address", "")
+                col_name    = (col.get("metadata") or {}).get("name", col_address[:20])
+
+                if not col_address:
+                    continue
+
                 try:
-                    floor_data = await fetch_floor(session, slug)
-                    if not floor_data:
-                        continue
+                    listings = await get_collection_listings(session, col_address)
 
-                    col_name, floor_ton, volume_ton, _ = floor_data
+                    if len(listings) < 2:
+                        continue  # Pas assez de données
 
-                    # Filtre anti-fake : ignorer collections mortes
+                    # Floor virtuel = médiane des prix en vente
+                    floor_ton  = compute_virtual_floor(listings)
+                    volume_ton = 0.0  # TonAPI ne donne pas le volume direct
+                    trend      = await get_floor_trend(col_address)
+
                     if floor_ton <= 0:
                         continue
 
-                    listings = await fetch_listings(session, slug)
-
-                    # Tendance du floor (hausse / baisse vs hier)
-                    trend = await get_floor_trend(slug)
+                    # Cache pour les stats du dashboard
+                    await cache_floor(col_address, col_name, floor_ton, volume_ton, len(listings))
 
                     for item in listings:
                         price = item["price_ton"]
@@ -671,7 +709,6 @@ async def sniper_loop():
                             continue
 
                         address = item["address"]
-                        # Anti-spam : déjà alerté ?
                         if await is_already_alerted(address):
                             continue
 
@@ -694,22 +731,24 @@ async def sniper_loop():
                         emoji = {"extreme": "🔴", "high": "🟠"}.get(priority, "🟢")
                         log.info(
                             f"{emoji} {item['name']} "
-                            f"@ {price:.4f} TON (floor {floor_ton:.4f}) "
-                            f"-{discount:.1f}% | score {score} | trend {trend:+.1f}%"
+                            f"@ {price:.4f} TON (floor médiane {floor_ton:.4f}) "
+                            f"-{discount:.1f}% | score {score}"
                         )
 
                         await send_alert(deal)
-                        await mark_as_alerted(address, item["name"], col_name,
-                                               price, floor_ton, round(discount, 1),
-                                               score=score, priority=priority)
+                        await mark_as_alerted(
+                            address, item["name"], col_name,
+                            price, floor_ton, round(discount, 1),
+                            score=score, priority=priority,
+                        )
                         deals_found += 1
 
                 except Exception as e:
-                    log.error(f"Erreur scan {slug}: {e}")
+                    log.error(f"Erreur scan {col_name}: {e}")
 
             await increment_scan()
             elapsed = time.time() - t0
-            log.info(f"✅ Scan #{scan_count} en {elapsed:.1f}s | {deals_found} deal(s)")
+            log.info(f"✅ Scan #{scan_count} en {elapsed:.1f}s | {deals_found} deal(s) | {len(collections)} collections")
 
             sleep_for = max(1.0, SCAN_INTERVAL - elapsed)
             await asyncio.sleep(sleep_for)
