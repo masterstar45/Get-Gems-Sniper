@@ -1,46 +1,74 @@
 /**
- * Hook qui lit les safe area insets depuis l'API Telegram WebApp
- * et les applique comme variables CSS sur <html> pour les utiliser partout.
+ * Hook qui lit les safe area insets depuis l'API Telegram WebApp.
  *
- * Telegram fournit :
- *   - window.Telegram.WebApp.safeAreaInset        (plein écran)
- *   - window.Telegram.WebApp.contentSafeAreaInset (zone de contenu)
- * Ces valeurs sont aussi disponibles via CSS :
- *   --tg-safe-area-inset-{top,bottom,left,right}
- *   --tg-content-safe-area-inset-{top,bottom,left,right}
+ * Telegram fournit TWO types of insets :
+ *   safeAreaInset        = zone couverte par le système (status bar, home indicator)
+ *   contentSafeAreaInset = zone couverte par l'UI Telegram (bouton "× Fermer", etc.)
+ *
+ * Le padding final en HAUT  = safeAreaInset.top    + contentSafeAreaInset.top
+ * Le padding final en BAS   = safeAreaInset.bottom + contentSafeAreaInset.bottom
+ *
+ * On lit aussi les CSS variables Telegram (--tg-safe-area-inset-*)
+ * et les env() natifs comme fallback.
  */
 
 import { useState, useEffect } from "react";
 
-interface Insets {
+export interface SafeInsets {
   top: number;
   bottom: number;
   left: number;
   right: number;
 }
 
-const ZERO: Insets = { top: 0, bottom: 0, left: 0, right: 0 };
+const ZERO: SafeInsets = { top: 0, bottom: 0, left: 0, right: 0 };
 
-function readFromTgApi(): Insets {
+/** Lit une CSS variable en px (ex. "44px" → 44) */
+function readCssVar(name: string): number {
   try {
-    const tgApp = (window as any).Telegram?.WebApp;
-    if (!tgApp) return ZERO;
+    const raw = getComputedStyle(document.documentElement)
+      .getPropertyValue(name)
+      .trim();
+    const n = parseFloat(raw);
+    return isNaN(n) ? 0 : n;
+  } catch { return 0; }
+}
 
-    const sa  = tgApp.safeAreaInset        ?? {};
-    const csa = tgApp.contentSafeAreaInset ?? {};
+function compute(): SafeInsets {
+  try {
+    const tg = (window as any).Telegram?.WebApp;
+
+    // 1. JS API (le plus fiable)
+    const sa  = tg?.safeAreaInset        ?? {};
+    const csa = tg?.contentSafeAreaInset ?? {};
+
+    const apiTop    = (sa.top    ?? 0) + (csa.top    ?? 0);
+    const apiBottom = (sa.bottom ?? 0) + (csa.bottom ?? 0);
+    const apiLeft   = (sa.left   ?? 0) + (csa.left   ?? 0);
+    const apiRight  = (sa.right  ?? 0) + (csa.right  ?? 0);
+
+    // 2. CSS variables posées par le SDK Telegram sur <html>
+    const cssTop    = readCssVar("--tg-safe-area-inset-top")
+                    + readCssVar("--tg-content-safe-area-inset-top");
+    const cssBottom = readCssVar("--tg-safe-area-inset-bottom")
+                    + readCssVar("--tg-content-safe-area-inset-bottom");
+    const cssLeft   = readCssVar("--tg-safe-area-inset-left")
+                    + readCssVar("--tg-content-safe-area-inset-left");
+    const cssRight  = readCssVar("--tg-safe-area-inset-right")
+                    + readCssVar("--tg-content-safe-area-inset-right");
 
     return {
-      top:    Math.max(sa.top    ?? 0, csa.top    ?? 0),
-      bottom: Math.max(sa.bottom ?? 0, csa.bottom ?? 0),
-      left:   Math.max(sa.left   ?? 0, csa.left   ?? 0),
-      right:  Math.max(sa.right  ?? 0, csa.right  ?? 0),
+      top:    Math.max(apiTop,    cssTop),
+      bottom: Math.max(apiBottom, cssBottom),
+      left:   Math.max(apiLeft,   cssLeft),
+      right:  Math.max(apiRight,  cssRight),
     };
   } catch {
     return ZERO;
   }
 }
 
-function applyCssVars(insets: Insets) {
+function apply(insets: SafeInsets) {
   const root = document.documentElement;
   root.style.setProperty("--app-safe-top",    `${insets.top}px`);
   root.style.setProperty("--app-safe-bottom", `${insets.bottom}px`);
@@ -48,39 +76,43 @@ function applyCssVars(insets: Insets) {
   root.style.setProperty("--app-safe-right",  `${insets.right}px`);
 }
 
-export function useSafeArea(): Insets {
-  const [insets, setInsets] = useState<Insets>(ZERO);
+export function useSafeArea(): SafeInsets {
+  const [insets, setInsets] = useState<SafeInsets>(ZERO);
 
   useEffect(() => {
+    let mounted = true;
+
     function update() {
-      const values = readFromTgApi();
-      setInsets(values);
-      applyCssVars(values);
+      if (!mounted) return;
+      const v = compute();
+      setInsets(v);
+      apply(v);
     }
 
-    // Lecture initiale (parfois disponible immédiatement)
+    // Lectures étalées dans le temps — le SDK Telegram initialise de façon asynchrone
     update();
-
-    // Lecture retardée pour laisser le temps au SDK d'initialiser
     const t1 = setTimeout(update, 100);
-    const t2 = setTimeout(update, 500);
+    const t2 = setTimeout(update, 400);
+    const t3 = setTimeout(update, 900);
+    const t4 = setTimeout(update, 2000);
 
-    // Écoute des événements Telegram de changement de safe area
+    // Écoute des événements Telegram
     try {
-      const tgApp = (window as any).Telegram?.WebApp;
-      tgApp?.onEvent?.("safeAreaChanged",        update);
-      tgApp?.onEvent?.("contentSafeAreaChanged", update);
-      tgApp?.onEvent?.("viewportChanged",        update);
-    } catch { /* SDK version trop ancienne */ }
+      const tg = (window as any).Telegram?.WebApp;
+      tg?.onEvent?.("safeAreaChanged",        update);
+      tg?.onEvent?.("contentSafeAreaChanged", update);
+      tg?.onEvent?.("viewportChanged",        update);
+    } catch { /* SDK trop ancien */ }
 
     return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
+      mounted = false;
+      clearTimeout(t1); clearTimeout(t2);
+      clearTimeout(t3); clearTimeout(t4);
       try {
-        const tgApp = (window as any).Telegram?.WebApp;
-        tgApp?.offEvent?.("safeAreaChanged",        update);
-        tgApp?.offEvent?.("contentSafeAreaChanged", update);
-        tgApp?.offEvent?.("viewportChanged",        update);
+        const tg = (window as any).Telegram?.WebApp;
+        tg?.offEvent?.("safeAreaChanged",        update);
+        tg?.offEvent?.("contentSafeAreaChanged", update);
+        tg?.offEvent?.("viewportChanged",        update);
       } catch { /* ignore */ }
     };
   }, []);
