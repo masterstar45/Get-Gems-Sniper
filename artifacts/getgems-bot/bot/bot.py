@@ -9,9 +9,11 @@ Priority: normal (30-50%) | high (50-70%) | extreme (70%+)
 """
 
 import asyncio
+import base64
 import logging
 import os
 import random
+import struct
 import time
 import psutil
 from datetime import datetime, timezone
@@ -24,6 +26,39 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from fake_useragent import UserAgent
+
+# ─── UTILITAIRES ADRESSES TON ────────────────────────────────────────────────
+
+def _crc16_ccitt(data: bytes) -> int:
+    """CRC-16/CCITT (polynomial 0x1021)."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+        crc &= 0xFFFF
+    return crc
+
+def ton_raw_to_friendly(addr: str, bounceable: bool = True) -> str:
+    """Convertit une adresse TON brute (0:hex64) en format user-friendly (EQ…).
+    Retourne l'adresse inchangée si déjà en format base64url ou si erreur."""
+    if not addr:
+        return addr
+    # Déjà en format friendly (commence par EQ, UQ, kQ, 0Q, etc.)
+    if ":" not in addr:
+        return addr
+    try:
+        wc_str, hex_part = addr.split(":", 1)
+        if len(hex_part) != 64:
+            return addr
+        wc   = int(wc_str) & 0xFF
+        tag  = 0x11 if bounceable else 0x51
+        body = bytes([tag, wc]) + bytes.fromhex(hex_part)
+        crc  = _crc16_ccitt(body)
+        full = body + struct.pack(">H", crc)
+        return base64.urlsafe_b64encode(full).decode()  # 48 chars, no padding needed
+    except Exception:
+        return addr
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -438,7 +473,7 @@ async def get_collection_listings(session: aiohttp.ClientSession, col_address: s
                 "name":      (item.get("metadata") or {}).get("name", "NFT"),
                 "price_ton": price_ton,
                 "image_url": image_url,
-                "link":      f"https://getgems.io/nft/{item.get('address', '')}",
+                "link":      f"https://getgems.io/nft/{ton_raw_to_friendly(item.get('address', ''))}",
             })
 
         if len(items) < limit:
@@ -1039,7 +1074,7 @@ async def handle_deals(req):
             "discountPercent": round(disc, 1),
             "score":          score,
             "priority":       prio_val,
-            "link":           f"https://getgems.io/nft/{addr}",
+            "link":           f"https://getgems.io/nft/{ton_raw_to_friendly(addr)}",
             "imageUrl":       img if img else None,
             "detectedAt":     r[7],
         })
@@ -1085,7 +1120,7 @@ async def handle_deals_history(req):
         "discountPercent": round(r[6] or 0, 1),
         "score":          r[8],
         "priority":       r[9],
-        "link":           f"https://getgems.io/nft/{r[1]}",
+        "link":           f"https://getgems.io/nft/{ton_raw_to_friendly(r[1])}",
         "detectedAt":     r[7],
     } for r in rows]
 
