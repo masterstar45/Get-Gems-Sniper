@@ -75,7 +75,6 @@
     "zod": "catalog:"
   },
   "dependencies": {
-    "@tonconnect/sdk": "^3.4.1",
-    "@tonconnect/ui-react": "^2.4.3"
+    "@tonconnect/sdk": "^3.4.1"
   }
 }

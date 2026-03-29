@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { haptic } from "@/hooks/useTelegram";
 import { useGetBotStatus } from "@workspace/api-client-react";
-import { useTonConnectUI, useTonWallet } from "@tonconnect/ui-react";
+import { useTonWallet } from "@/hooks/useTonWallet";
 import { useState } from "react";
 
 const TABS = [
@@ -20,14 +20,10 @@ const TABS = [
 // ── Bouton Wallet TON ──────────────────────────────────────────────────────────
 
 function WalletButton() {
-  const [tonConnectUI] = useTonConnectUI();
-  const wallet = useTonWallet();
+  const { connected, shortAddress, loading, connect, disconnect } = useTonWallet();
   const [showDisconnect, setShowDisconnect] = useState(false);
 
-  const addr = wallet?.account?.address;
-  const short = addr ? addr.slice(0, 4) + "…" + addr.slice(-4) : null;
-
-  if (wallet && short) {
+  if (connected && shortAddress) {
     return (
       <div className="relative">
         <button
@@ -36,13 +32,13 @@ function WalletButton() {
           style={{ background: "rgba(0,122,255,0.15)", border: "1px solid rgba(0,122,255,0.35)", color: "#007aff" }}
         >
           <Wallet className="w-3 h-3" />
-          {short}
+          {shortAddress}
         </button>
         {showDisconnect && (
           <div className="absolute right-0 top-full mt-1 z-50 rounded-xl overflow-hidden shadow-xl"
             style={{ background: "var(--tg-theme-secondary-bg-color)", border: "1px solid rgba(255,255,255,0.1)" }}>
             <button
-              onClick={() => { haptic.medium(); tonConnectUI.disconnect(); setShowDisconnect(false); }}
+              onClick={() => { haptic.medium(); disconnect(); setShowDisconnect(false); }}
               className="flex items-center gap-2 px-4 py-3 text-xs font-semibold whitespace-nowrap w-full"
               style={{ color: "#ff453a" }}
             >
@@ -57,12 +53,13 @@ function WalletButton() {
 
   return (
     <button
-      onClick={() => { haptic.select(); tonConnectUI.openModal(); }}
-      className="flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[11px] font-bold transition-all active:scale-95"
+      onClick={() => { haptic.select(); connect(); }}
+      disabled={loading}
+      className="flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[11px] font-bold transition-all active:scale-95 disabled:opacity-50"
       style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", color: "var(--tg-theme-hint-color)" }}
     >
-      <Wallet className="w-3 h-3" />
-      Wallet
+      <Wallet className={`w-3 h-3 ${loading ? "animate-pulse" : ""}`} />
+      {loading ? "…" : "Wallet"}
     </button>
   );
 }

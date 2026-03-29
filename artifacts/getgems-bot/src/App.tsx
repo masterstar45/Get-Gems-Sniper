@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 import { Switch, Route, Router as WouterRouter } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { TonConnectUIProvider } from "@tonconnect/ui-react";
 import { Toaster } from "@/components/ui/toaster";
 import { Layout } from "@/components/layout/Layout";
 import DealsPage from "@/pages/deals";
@@ -14,8 +13,6 @@ import SettingsPage from "@/pages/settings";
 import NotFound from "@/pages/not-found";
 import { tg } from "@/hooks/useTelegram";
 import { setBaseUrl } from "@workspace/api-client-react";
-
-const TONCONNECT_MANIFEST = "https://get-gems-sniper-production.up.railway.app/tonconnect-manifest.json";
 
 // Si VITE_API_BASE_URL est défini (ex: Railway URL), l'API s'y connecte
 // Sinon, les appels API vont vers le serveur courant (Replit)
@@ -80,14 +77,12 @@ function App() {
   }, []);
 
   return (
-    <TonConnectUIProvider manifestUrl={TONCONNECT_MANIFEST}>
-      <QueryClientProvider client={queryClient}>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
-          <Router />
-        </WouterRouter>
-        <Toaster />
-      </QueryClientProvider>
-    </TonConnectUIProvider>
+    <QueryClientProvider client={queryClient}>
+      <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+        <Router />
+      </WouterRouter>
+      <Toaster />
+    </QueryClientProvider>
   );
 }
 
