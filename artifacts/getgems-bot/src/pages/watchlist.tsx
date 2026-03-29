@@ -7,12 +7,16 @@ import {
   getGetWatchlistQueryKey,
 } from "@workspace/api-client-react";
 import type { WatchlistItem } from "@workspace/api-client-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, useMutation } from "@tanstack/react-query";
+
 import { Trash2, Target, Zap, RefreshCw, Search, X, Plus, Edit2, Check } from "lucide-react";
 import { haptic, tg } from "@/hooks/useTelegram";
 import { formatDistanceToNow } from "date-fns";
 import { fr } from "date-fns/locale";
+
 import { motion, AnimatePresence } from "framer-motion";
+
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
 
 const TG_BLUE   = "var(--tg-theme-button-color)";
 const TG_GREEN  = "#30d158";
@@ -355,6 +359,23 @@ export default function WatchlistPage() {
     },
   });
 
+  // PUT /api/watchlist/:id — updates alert_threshold in-place, no recreate
+  const updateThresholdMutation = useMutation({
+    mutationFn: async ({ id, alertThreshold }: { id: number; alertThreshold: number }) => {
+      const r = await fetch(`${API_BASE}/api/watchlist/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alertThreshold }),
+      });
+      if (!r.ok) throw new Error(`PUT watchlist failed: ${r.status}`);
+      return r.json() as Promise<WatchlistItem>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: getGetWatchlistQueryKey() });
+      haptic.success();
+    },
+  });
+
   const confirmRemove = (id: number, name: string) => {
     haptic.medium();
     if (tg) {
@@ -366,25 +387,9 @@ export default function WatchlistPage() {
     }
   };
 
-  // Update threshold: POST new entry first, THEN delete old — safe order prevents data loss
   const handleUpdateThreshold = (newThreshold: number, item: WatchlistItem) => {
     haptic.medium();
-    // 1. Add new entry with updated threshold
-    addMutation.mutate(
-      {
-        data: {
-          collectionSlug: item.collectionSlug,
-          collectionName: item.collectionName,
-          alertThreshold: newThreshold,
-        },
-      },
-      {
-        onSuccess: () => {
-          // 2. Only remove old entry once new one is confirmed created
-          removeMutation.mutate({ id: item.id! });
-        },
-      }
-    );
+    updateThresholdMutation.mutate({ id: item.id!, alertThreshold: newThreshold });
   };
 
   const filtered = useMemo(() => {
