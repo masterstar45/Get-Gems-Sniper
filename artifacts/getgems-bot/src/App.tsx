@@ -9,6 +9,13 @@ import WatchlistPage from "@/pages/watchlist";
 import SettingsPage from "@/pages/settings";
 import NotFound from "@/pages/not-found";
 import { tg } from "@/hooks/useTelegram";
+import { setBaseUrl } from "@workspace/api-client-react";
+
+// Si VITE_API_BASE_URL est défini (ex: Railway URL), l'API s'y connecte
+// Sinon, les appels API vont vers le serveur courant (Replit)
+if (import.meta.env.VITE_API_BASE_URL) {
+  setBaseUrl(import.meta.env.VITE_API_BASE_URL as string);
+}
 
 const queryClient = new QueryClient({
   defaultOptions: {
