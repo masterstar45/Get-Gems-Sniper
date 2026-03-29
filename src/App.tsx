@@ -47,8 +47,7 @@ function Router() {
 }
 
 // Couleurs dark mode (synchronisées avec index.css fallbacks)
-const DARK_BG  = "#1c1c1e";
-const DARK_SEC = "#2c2c2e";
+const DARK_BG = "#1c1c1e";
 
 function App() {
   useEffect(() => {
