@@ -126,6 +126,17 @@ async def init_db():
                 alert_threshold  INTEGER DEFAULT 40,
                 added_at         TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS news (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                title        TEXT NOT NULL,
+                url          TEXT UNIQUE,
+                summary      TEXT,
+                source       TEXT,
+                category     TEXT DEFAULT 'ecosystem',
+                published_at TEXT,
+                fetched_at   TEXT DEFAULT (datetime('now'))
+            );
         """)
         # Migrations sans-casse (colonnes ajoutées si absentes)
         for col_def in [
@@ -702,6 +713,158 @@ async def send_alert(deal: dict):
     except Exception as e:
         log.error(f"Erreur envoi Telegram: {e}")
 
+# ─── ACTUALITÉS TON GIFTS ─────────────────────────────────────────────────────
+
+import xml.etree.ElementTree as _ET
+
+INITIAL_NEWS = [
+    {
+        "title": "TON Gifts : 2,18M de détenteurs et 312M$ de volume total",
+        "url": "https://ton.org/en/blog/ton-gifts-milestone",
+        "summary": "L'écosystème TON Gifts a atteint des sommets historiques en novembre 2025 avec 2,18 millions de détenteurs et 312,2 millions de dollars de volume de négociation total sur la blockchain TON.",
+        "source": "TON Foundation",
+        "category": "milestone",
+        "published_at": "2025-11-15T00:00:00",
+    },
+    {
+        "title": "Khabib Nurmagomedov lance la collection NFT Papakha sur Telegram",
+        "url": "https://getgems.io/collection/papakha",
+        "summary": "La légende du MMA Khabib Nurmagomedov lance la collection 'Papakha', qui devient virale et booste le volume global des TON Gifts à des niveaux records.",
+        "source": "GetGems",
+        "category": "launch",
+        "published_at": "2025-11-10T00:00:00",
+    },
+    {
+        "title": "Les TON Gifts deviennent des NFT échangeables sur la blockchain TON",
+        "url": "https://telegram.org/blog/gifts",
+        "summary": "Telegram étend les fonctionnalités : les cadeaux collectibles peuvent être portés comme statuts emoji, transférés ou mis aux enchères via la blockchain TON. Paiement en TON ou Stars.",
+        "source": "Telegram",
+        "category": "feature",
+        "published_at": "2025-10-01T00:00:00",
+    },
+    {
+        "title": "Crafting NFT : combiner des cadeaux Telegram pour en créer de nouveaux",
+        "url": "https://ton.org/en/blog/gifts-crafting",
+        "summary": "Des rumeurs et indices officiels pointent vers un système de 'crafting' permettant de fusionner plusieurs cadeaux existants pour générer des NFT exclusifs plus rares.",
+        "source": "TON Ecosystem",
+        "category": "rumor",
+        "published_at": "2025-12-01T00:00:00",
+    },
+    {
+        "title": "Toncoin accepté comme paiement secondaire pour les TON Gifts",
+        "url": "https://telegram.org/blog/toncoin-gifts",
+        "summary": "Telegram officialise l'utilisation du Toncoin (TON) comme option de paiement pour les transactions de cadeaux numériques, en complément des Telegram Stars.",
+        "source": "Telegram",
+        "category": "feature",
+        "published_at": "2025-09-15T00:00:00",
+    },
+]
+
+RSS_SOURCES = [
+    ("https://cointelegraph.com/rss/tag/ton",        "CoinTelegraph"),
+    ("https://decrypt.co/feed/tag/ton",              "Decrypt"),
+]
+
+async def seed_initial_news():
+    """Insère les actualités initiales si la table est vide."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM news") as cur:
+            count = (await cur.fetchone())[0]
+        if count == 0:
+            for n in INITIAL_NEWS:
+                await db.execute("""
+                    INSERT OR IGNORE INTO news (title, url, summary, source, category, published_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (n["title"], n["url"], n["summary"], n["source"], n["category"], n["published_at"]))
+            await db.commit()
+            log.info(f"✅ {len(INITIAL_NEWS)} actualités initiales insérées")
+
+async def fetch_rss_news(session: aiohttp.ClientSession):
+    """Tente de récupérer les dernières actualités depuis les flux RSS."""
+    for url, source_name in RSS_SOURCES:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    continue
+                text = await resp.text()
+            root = _ET.fromstring(text)
+            ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+            channel = root.find("channel")
+            if channel is None:
+                continue
+            items = channel.findall("item")[:10]
+            async with aiosqlite.connect(DB_PATH) as db:
+                inserted = 0
+                for item in items:
+                    title = (item.findtext("title") or "").strip()
+                    link  = (item.findtext("link")  or "").strip()
+                    desc  = (item.findtext("description") or "").strip()[:400]
+                    pubdate = (item.findtext("pubDate") or "").strip()
+                    if not title or not link:
+                        continue
+                    try:
+                        await db.execute("""
+                            INSERT OR IGNORE INTO news (title, url, summary, source, category, published_at)
+                            VALUES (?, ?, ?, ?, 'ecosystem', ?)
+                        """, (title, link, desc, source_name, pubdate))
+                        inserted += 1
+                    except Exception:
+                        pass
+                await db.commit()
+            log.info(f"📰 RSS {source_name}: {inserted} article(s) importé(s)")
+        except Exception as e:
+            log.debug(f"RSS {source_name} inaccessible: {e}")
+
+_last_news_fetch: float = 0.0
+
+async def maybe_refresh_news(session: aiohttp.ClientSession):
+    global _last_news_fetch
+    if time.time() - _last_news_fetch > 3600:
+        _last_news_fetch = time.time()
+        await fetch_rss_news(session)
+
+
+# ─── COLLECTIONS SPOTLIGHT (TON Gifts curatées) ───────────────────────────────
+
+SPOTLIGHT_COLLECTIONS = [
+    {
+        "name": "Papakha by Khabib",
+        "url": "https://getgems.io/collection/papakha",
+        "description": "Collection lancée par la légende du MMA Khabib Nurmagomedov",
+        "category": "celebrity",
+        "emoji": "🥊",
+    },
+    {
+        "name": "Telegram Gifts",
+        "url": "https://getgems.io/?filter=gifts",
+        "description": "Cadeaux Telegram convertis en NFT échangeables sur la blockchain TON",
+        "category": "official",
+        "emoji": "🎁",
+    },
+    {
+        "name": "TON Punks",
+        "url": "https://getgems.io/collection/ton-punks",
+        "description": "La collection OG de l'écosystème TON — référence de liquidité",
+        "category": "og",
+        "emoji": "👾",
+    },
+    {
+        "name": "Getgems Anonymous",
+        "url": "https://getgems.io/collection/getgems-anonymous",
+        "description": "Collection phare de la marketplace GetGems",
+        "category": "og",
+        "emoji": "🎭",
+    },
+    {
+        "name": "TON Diamonds",
+        "url": "https://getgems.io/collection/ton-diamonds",
+        "description": "NFT de haute valeur — floor élevé, fort potentiel de plus-value",
+        "category": "premium",
+        "emoji": "💎",
+    },
+]
+
+
 # ─── BOUCLE DE SNIPING ────────────────────────────────────────────────────────
 
 async def sniper_loop():
@@ -732,6 +895,9 @@ async def sniper_loop():
             t0 = time.time()
             scan_count += 1
             deals_found = 0
+
+            # ── Refresh actualités toutes les heures ─────────────────────
+            await maybe_refresh_news(session)
 
             # ── Redécouverte des collections toutes les 30 min ──────────────
             if time.time() - _last_discovery > 1800 or not _discovered_collections:
@@ -1100,6 +1266,58 @@ async def handle_watchlist_delete(req):
     except Exception as e:
         return json_resp({"error": str(e)}, 500)
 
+# ── GET /api/news ──
+async def handle_news(req):
+    limit = int(req.rel_url.query.get("limit", 20))
+    category = req.rel_url.query.get("category", "")
+    sql = "SELECT id, title, url, summary, source, category, published_at FROM news WHERE 1=1"
+    params: list = []
+    if category:
+        sql += " AND category = ?"
+        params.append(category)
+    sql += " ORDER BY published_at DESC LIMIT ?"
+    params.append(limit)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+    items = [
+        {
+            "id": r[0], "title": r[1], "url": r[2], "summary": r[3],
+            "source": r[4], "category": r[5], "publishedAt": r[6],
+        }
+        for r in rows
+    ]
+    return json_resp(items)
+
+# ── GET /api/featured ──
+async def handle_featured(req):
+    """Collections en vedette : top actives + spotlight curatées."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT slug, name, floor_ton, item_count, updated_at
+            FROM floor_cache
+            WHERE floor_ton > 0
+            ORDER BY item_count DESC, floor_ton DESC
+            LIMIT 10
+        """) as cur:
+            rows = await cur.fetchall()
+    live = [
+        {
+            "slug": r[0],
+            "name": r[1],
+            "floorTon": round(r[2], 4),
+            "listings": r[3],
+            "updatedAt": r[4],
+            "url": f"https://getgems.io/collection/{r[0]}",
+            "type": "live",
+        }
+        for r in rows
+    ]
+    return json_resp({
+        "live": live,
+        "spotlight": SPOTLIGHT_COLLECTIONS,
+    })
+
 # ── GET /api/bot/status ──
 async def handle_bot_status(req):
     s = await get_stats()
@@ -1270,7 +1488,9 @@ async def start_web_server():
     app.router.add_get("/api/deals/history",         handle_deals_history)
     app.router.add_get("/api/stats/charts",          handle_stats_charts)
     app.router.add_get("/api/collections",           handle_collections)
-    app.router.add_get("/api/trends",               handle_trends)
+    app.router.add_get("/api/trends",                handle_trends)
+    app.router.add_get("/api/news",                  handle_news)
+    app.router.add_get("/api/featured",              handle_featured)
     app.router.add_get("/api/watchlist",             handle_watchlist_get)
     app.router.add_post("/api/watchlist",            handle_watchlist_post)
     app.router.add_delete("/api/watchlist/{id}",     handle_watchlist_delete)
@@ -1299,6 +1519,7 @@ async def main():
         bot = Bot(token=TELEGRAM_TOKEN)
 
     await init_db()
+    await seed_initial_news()
 
     # Serveur web : API REST + fichiers statiques Mini App
     await start_web_server()
